@@ -3,6 +3,7 @@ imitation_planner:
   _convert_: "all"
 
   replan_interval: 1
+  record_latency: false  # set true to record per-step latency to benchmarks/mini_v1/latency.csv
 
   planner:
     _target_: src.models.planTF.planning_model.PlanningModel

@@ -1,5 +1,7 @@
 import time
 from typing import List, Optional, Type
+import os
+import csv
 
 import numpy as np
 import torch
@@ -23,7 +25,9 @@ from nuplan.planning.training.modeling.torch_module_wrapper import TorchModuleWr
 
 from src.feature_builders.common.utils import rotate_round_z_axis
 
+from .mode_reranker import rerank_modes
 from .planner_utils import global_trajectory_to_states, load_checkpoint
+
 
 
 class ImitationPlanner(AbstractPlanner):
@@ -39,10 +43,13 @@ class ImitationPlanner(AbstractPlanner):
         planner_ckpt: str = None,
         replan_interval: int = 1,
         use_gpu: bool = True,
+        record_latency: bool = False,
     ) -> None:
         """
         Initializes the ML planner class.
         :param model: Model to use for inference.
+        :param record_latency: If True, append per-step latency to
+            benchmarks/mini_v1/latency.csv.  Default False (off in eval runs).
         """
         if use_gpu:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,6 +72,26 @@ class ImitationPlanner(AbstractPlanner):
         # Runtime stats for the MLPlannerReport
         self._feature_building_runtimes: List[float] = []
         self._inference_runtimes: List[float] = []
+
+        # Latency CSV (opt-in only — leave off for normal eval runs)
+        self._record_latency = record_latency
+        if self._record_latency:
+            self._benchmark_dir = os.path.join(os.getcwd(), "benchmarks", "mini_v1")
+            self._latency_csv = os.path.join(self._benchmark_dir, "latency.csv")
+            os.makedirs(self._benchmark_dir, exist_ok=True)
+
+            if not os.path.exists(self._latency_csv):
+                with open(self._latency_csv, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "step",
+                        "feature_build_ms",
+                        "forward_ms",
+                        "total_planner_ms",
+                        "gpu_mem_mb",
+                    ])
+
+        self._step_idx = 0
 
     def initialize(self, initialization: PlannerInitialization) -> None:
         """Inherited, see superclass."""
@@ -89,28 +116,59 @@ class ImitationPlanner(AbstractPlanner):
         return DetectionsTracks  # type: ignore
 
     def _planning(self, current_input: PlannerInput):
-        self._start_time = time.perf_counter()
+        planner_start = time.perf_counter()
+
+        feature_start = time.perf_counter()
         planner_feature = self._planner_feature_builder.get_features_from_simulation(
             current_input, self._initialization
         )
         planner_feature_torch = planner_feature.collate(
             [planner_feature.to_feature_tensor().to_device(self.device)]
         )
-        self._feature_building_runtimes.append(time.perf_counter() - self._start_time)
+        feature_end = time.perf_counter()
+        feature_build_ms = (feature_end - feature_start) * 1000.0
+        self._feature_building_runtimes.append(feature_end - feature_start)
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        forward_start = time.perf_counter()
 
         out = self._planner.forward(planner_feature_torch.data)
-        local_trajectory = out["output_trajectory"][0].cpu().numpy()
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        forward_end = time.perf_counter()
+        forward_ms = (forward_end - forward_start) * 1000.0
+
+        local_trajectory = rerank_modes(out, planner_feature_torch.data)
+
+        planner_end = time.perf_counter()
+        total_planner_ms = (planner_end - planner_start) * 1000.0
+
+        gpu_mem_mb = 0.0
+        if self.device.type == "cuda":
+            gpu_mem_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
+
+        if self._record_latency:
+            with open(self._latency_csv, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self._step_idx,
+                    feature_build_ms,
+                    forward_ms,
+                    total_planner_ms,
+                    gpu_mem_mb,
+                ])
+
+        self._step_idx += 1
+        self._start_time = planner_start
 
         return local_trajectory.astype(np.float64)
 
     def compute_planner_trajectory(
         self, current_input: PlannerInput
     ) -> AbstractTrajectory:
-        """
-        Infer relative trajectory poses from model and convert to absolute agent states wrapped in a trajectory.
-        Inherited, see superclass.
-        """
-        ego_state = current_input.history.ego_states[-1]
+        ego_state = current_input.history.ego_states[-1]    
 
         if self._last_plan_elapsed_step >= self._replan_interval:
             local_trajectory = self._planning(current_input)
@@ -131,7 +189,6 @@ class ImitationPlanner(AbstractPlanner):
         )
 
         self._inference_runtimes.append(time.perf_counter() - self._start_time)
-
         self._last_plan_elapsed_step += 1
 
         return trajectory
