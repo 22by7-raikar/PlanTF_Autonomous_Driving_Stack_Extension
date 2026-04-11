@@ -431,14 +431,48 @@ def _to_device(data: dict, device: torch.device) -> dict:
 # ---------------------------------------------------------------------------
 # Pretty-printers
 # ---------------------------------------------------------------------------
+# The latency table is designed to grow.  It currently shows FP32 and FP16
+# rows; the INT8 row is an explicit placeholder until Phase 2 (feature/int8-ptq)
+# fills it in.  Having the placeholder visible now means:
+#   1. The table structure is agreed on and reviewable before INT8 work starts.
+#   2. Anyone running the benchmark can see what is still TODO.
+# The _INT8_PENDING sentinel string is checked by _print_latency_table to
+# render a “–” cell instead of trying to format a float.
+
+_INT8_PENDING = "__INT8_PENDING__"
 
 _W_LABEL = 28
 _W_COL   = 9
 
 
-def _print_latency_table(results: dict) -> None:
+def _precision_tag(label: str) -> str:
+    """Return a short [FP32]/[FP16]/[INT8] annotation based on the label."""
+    lo = label.lower()
+    if "int8" in lo:  return "[INT8]"
+    if "fp16" in lo:  return "[FP16]"
+    if "fp32" in lo:  return "[FP32]"
+    return ""
+
+
+def _print_latency_table(results: dict, show_int8_todo: bool = True) -> None:
+    """
+    Print the latency comparison table.
+
+    results       — {label: stats_dict} as returned by _stats().  May contain
+                    an entry with value _INT8_PENDING to show a placeholder row.
+    show_int8_todo — when True and no INT8 entry is present, append a TODO row
+                    so the future row’s position is visible.
+    """
     cols = ["mean_ms", "p50_ms", "p95_ms", "max_ms", "throughput_qps"]
     hdrs = ["mean", "p50", "p95", "max", "qps"]
+
+    # Inject the INT8 placeholder if not already present and requested.
+    # We copy results so the caller’s dict is not mutated.
+    display = dict(results)
+    has_int8 = any("int8" in k.lower() for k in display)
+    if show_int8_todo and not has_int8:
+        display["TRT INT8 (Phase 2 – TODO)"] = _INT8_PENDING
+
     print()
     print("=" * ((_W_LABEL + 2) + len(cols) * (_W_COL + 2)))
     header = f"  {'Variant':{_W_LABEL}}"
@@ -446,9 +480,24 @@ def _print_latency_table(results: dict) -> None:
         header += f"  {h:>{_W_COL}}"
     print(header)
     print("  " + "-" * (_W_LABEL + len(cols) * (_W_COL + 2)))
+
     baseline = None
-    for label, stats in results.items():
-        row = f"  {label:{_W_LABEL}}"
+    for label, stats in display.items():
+        tag = _precision_tag(label)
+        display_label = f"{label} {tag}".strip() if tag else label
+
+        if stats is _INT8_PENDING:
+            # Render the placeholder row with – in every cell.
+            # Note: the dash is pre-assigned; Python 3.9 disallows backslash
+            # escapes inside f-string expressions.
+            _dash = "\u2013"
+            row = f"  {display_label:{_W_LABEL}}"
+            for _ in cols:
+                row += f"  {_dash:>{_W_COL}}"
+            print(row)
+            continue
+
+        row = f"  {display_label:{_W_LABEL}}"
         for c in cols:
             v = stats[c]
             if c == "throughput_qps":
@@ -460,16 +509,21 @@ def _print_latency_table(results: dict) -> None:
             baseline = stats["mean_ms"]
     print("=" * ((_W_LABEL + 2) + len(cols) * (_W_COL + 2)))
 
-    # Speedup column
-    if len(results) > 1:
-        baseline_label = list(results.keys())[0]
+    # Speedup footer (skip placeholder rows).
+    real_results = {k: v for k, v in display.items() if v is not _INT8_PENDING}
+    if len(real_results) > 1 and baseline is not None:
+        baseline_label = list(real_results.keys())[0]
         print(f"\n  Speedup vs '{baseline_label}':")
-        for label, stats in results.items():
+        for label, stats in real_results.items():
             if label == baseline_label:
                 continue
             ratio = baseline / stats["mean_ms"]
-            direction = f"{ratio:.2f}× faster" if ratio >= 1 else f"{1/ratio:.2f}× slower"
+            direction = f"{ratio:.2f}\u00d7 faster" if ratio >= 1 else f"{1/ratio:.2f}\u00d7 slower"
             print(f"    {label}: {direction}")
+
+    if show_int8_todo and not has_int8:
+        print("\n  INT8 row: implement in feature/int8-ptq (see inference/deploy/QUANTIZATION_REPORT.md)")
+
 
 
 def _print_fidelity_table(fidelity: dict) -> None:

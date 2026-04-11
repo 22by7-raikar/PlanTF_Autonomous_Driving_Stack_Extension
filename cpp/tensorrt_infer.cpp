@@ -41,6 +41,19 @@
 
 #include <NvOnnxParser.h>
 
+// ── NVTX (optional profiling ranges) ────────────────────────────────────────
+// nvtxRangePushA/nvtxRangePop are no-ops unless ENABLE_NVTX is defined at
+// build time.  That flag is set by CMake when -DENABLE_NVTX=ON is passed,
+// which also links libnvToolsExt.so.  Keeping this behind a macro means the
+// binary works identically with or without NVTX installed.
+#ifdef ENABLE_NVTX
+#  include <nvToolsExt.h>
+#  define NVTX_PUSH(name) nvtxRangePushA(name)
+#  define NVTX_POP()      nvtxRangePop()
+#else
+#  define NVTX_PUSH(name) do {} while(0)
+#  define NVTX_POP()      do {} while(0)
+#endif
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -204,18 +217,54 @@ int main(int argc, char* argv[]) {
     std::cout << " done\n";
 
     // ── Timed runs ───────────────────────────────────────────────────────────
+    // Each iteration is structured identically to how the Python planner
+    // sends work to the engine:
+    //
+    //   [trt_h2d]     Copy input buffers from host to device.  In the C++
+    //                 benchmark the inputs are already on the device (filled
+    //                 once in alloc_engine_buffers), so this range measures
+    //                 almost nothing here.  In a real deployment loop this
+    //                 would be per-frame sensor data.
+    //
+    //   [trt_enqueue] The actual TRT inference: kernel scheduling on the
+    //                 CUDA stream + waiting for completion.  This is what
+    //                 appears in the Nsight Systems compute timeline.
+    //
+    //   [trt_d2h]     Copy the trajectory output back to the host so the
+    //                 planner can select a mode.
+    //
+    // NVTX ranges are only emitted when ENABLE_NVTX=ON at build time.
     std::cout << "Timing (" << args.runs << " runs, CUDA events)..." << std::flush;
     std::vector<double> times;
     times.reserve(args.runs);
 
     for (int i = 0; i < args.runs; ++i) {
+        // H2D: in this benchmark inputs are pre-loaded; range is a structural
+        // placeholder that would contain cudaMemcpyAsync() calls in production.
+        NVTX_PUSH("trt_h2d");
+        NVTX_POP();
+
+        // Inference timing via CUDA events (measures GPU execution time only,
+        // not host overhead around the enqueueV3 call).
+        NVTX_PUSH("trt_enqueue");
         CUDA_CHECK(cudaEventRecord(ev_start, stream));
         context->enqueueV3(stream);
         CUDA_CHECK(cudaEventRecord(ev_stop, stream));
         CUDA_CHECK(cudaEventSynchronize(ev_stop));
+        NVTX_POP();
+
         float ms = 0.f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
         times.push_back(static_cast<double>(ms));
+
+        // D2H: copy output tensor back to host for inspection / comparison.
+        NVTX_PUSH("trt_d2h");
+        for (auto& buf : buffers) {
+            if (!buf.is_output()) continue;
+            CUDA_CHECK(cudaMemcpy(buf.host_ptr, buf.device_ptr,
+                static_cast<size_t>(buf.nbytes), cudaMemcpyDeviceToHost));
+        }
+        NVTX_POP();
     }
     std::cout << " done\n";
 
@@ -224,11 +273,11 @@ int main(int argc, char* argv[]) {
     print_latency(times, label);
 
     // ── Copy outputs to host and print ───────────────────────────────────────
+    // Outputs are already on the host after the D2H copy inside the timing
+    // loop above, so we just print them here without an extra memcpy.
     std::cout << "\nOutput tensors:\n";
     for (auto& buf : buffers) {
         if (!buf.is_output()) continue;
-        CUDA_CHECK(cudaMemcpy(buf.host_ptr, buf.device_ptr,
-            static_cast<size_t>(buf.nbytes), cudaMemcpyDeviceToHost));
         std::cout << "  " << buf.name << "  shape=[";
         for (size_t d = 0; d < buf.shape.size(); ++d)
             std::cout << (d?",":"") << buf.shape[d];

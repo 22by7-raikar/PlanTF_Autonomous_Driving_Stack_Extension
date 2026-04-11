@@ -165,3 +165,11 @@ outputs/
 inference/*.onnx
 inference/*.trt
 checkpoints/
+
+# Nsight Systems / Nsight Compute profiling artefacts
+# outputs/profiles/ is already covered by the outputs/ rule above.
+# These extensions catch any stray reports produced outside that directory
+# (e.g. when nsys is invoked manually with a custom --output path).
+*.nsys-rep
+*.sqlite
+*.ncu-rep

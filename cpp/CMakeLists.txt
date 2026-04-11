@@ -7,8 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ── Build options ────────────────────────────────────────────────────────────
 option(ENABLE_CUDA   "Enable ONNX Runtime CUDA execution provider" OFF)
 option(ENABLE_TRT    "Enable TensorRT C++ inference target"        OFF)
-option(ENABLE_ASAN   "Enable AddressSanitizer (debug only)"        OFF)
-
+option(ENABLE_ASAN   "Enable AddressSanitizer (debug only)"        OFF)option(ENABLE_NVTX
+    "Enable NVTX profiling ranges in trt_infer (requires ENABLE_TRT=ON).\n"
+    "Adds #define ENABLE_NVTX and links libnvToolsExt.so.\n"
+    "Only useful when running the binary under: nsys profile --trace=nvtx"
+    OFF
+)
 # ── ONNX Runtime ─────────────────────────────────────────────────────────────
 # Set ORT_ROOT to your ONNX Runtime installation, e.g.:
 #   cmake .. -DORT_ROOT=/opt/onnxruntime-linux-x64-1.19.2
@@ -141,6 +145,60 @@ if(ENABLE_TRT)
     add_definitions(-DENABLE_TRT=1)
 endif()
 
+# ── NVTX (optional profiling ranges) ────────────────────────────────────────────
+# NVTX (NVIDIA Tools Extension) lets you annotate regions in C++ code that
+# then appear as named bands in the Nsight Systems timeline.  The library
+# ships inside the nvidia-cuda-nvtx pip wheel, which is part of the same
+# CUDA 11.x stack already used for cudart and TRT.
+#
+# To enable:
+#   cmake .. -DENABLE_TRT=ON -DENABLE_CUDA=ON -DENABLE_NVTX=ON
+# Then run:  nsys profile --trace=cuda,nvtx ./trt_infer
+if(ENABLE_NVTX)
+    if(NOT ENABLE_TRT)
+        message(FATAL_ERROR "ENABLE_NVTX requires ENABLE_TRT=ON")
+    endif()
+
+    # Default search path: nvidia-cuda-nvtx pip wheel in the conda env.
+    # The wheel installs nvToolsExt.h under include/ and
+    # libnvidia-ml.so / libnvToolsExt.so under lib/.
+    if(NOT DEFINED NVTX_INC_DIR)
+        set(NVTX_INC_DIR
+            "$ENV{CONDA_PREFIX}/lib/python3.9/site-packages/nvidia/cuda_nvtx/include")
+    endif()
+    if(NOT DEFINED NVTX_LIB_DIR)
+        set(NVTX_LIB_DIR
+            "$ENV{CONDA_PREFIX}/lib/python3.9/site-packages/nvidia/cuda_nvtx/lib")
+    endif()
+
+    find_path(NVTX_INCLUDE_DIR NAMES nvToolsExt.h
+        HINTS
+            "${NVTX_INC_DIR}"
+            "${CUDA_INCLUDE_DIR}"          # system CUDA toolkit also has it
+            /usr/local/cuda/include
+        NO_DEFAULT_PATH
+    )
+    find_library(NVTX_LIBRARY NAMES nvToolsExt
+        HINTS
+            "${NVTX_LIB_DIR}"
+            "${CUDA_LIB_DIR}"
+            /usr/local/cuda/lib64
+        NO_DEFAULT_PATH
+    )
+
+    if(NOT NVTX_INCLUDE_DIR OR NOT NVTX_LIBRARY)
+        message(FATAL_ERROR
+            "NVTX not found.\n"
+            "  Install with: pip install nvidia-cuda-nvtx-cu11\n"
+            "  or set -DNVTX_INC_DIR and -DNVTX_LIB_DIR\n"
+        )
+    endif()
+
+    message(STATUS "NVTX include : ${NVTX_INCLUDE_DIR}")
+    message(STATUS "NVTX library : ${NVTX_LIBRARY}")
+    add_definitions(-DENABLE_NVTX=1)
+endif()
+
 # ── Sanitizer ────────────────────────────────────────────────────────────────
 if(ENABLE_ASAN)
     add_compile_options(-fsanitize=address -g)
@@ -172,6 +230,10 @@ if(ENABLE_TRT)
         ${TRT_ONNX_LIB}
         ${CUDA_RT_LIBRARY}
     )
+    if(ENABLE_NVTX)
+        target_include_directories(trt_infer PRIVATE ${NVTX_INCLUDE_DIR})
+        target_link_libraries(trt_infer PRIVATE ${NVTX_LIBRARY})
+    endif()
     target_compile_options(trt_infer PRIVATE -O2 -Wall -Wextra)
     # Runtime note: export LD_LIBRARY_PATH=${TRT_ROOT}:${CUDA_LIB_DIR}:$LD_LIBRARY_PATH
 endif()
@@ -187,6 +249,7 @@ message(STATUS "")
 message(STATUS "planTF C++ runtime build configuration:")
 message(STATUS "  CUDA provider   : ${ENABLE_CUDA}")
 message(STATUS "  TensorRT target : ${ENABLE_TRT}")
+message(STATUS "  NVTX ranges     : ${ENABLE_NVTX}")
 message(STATUS "  ASan            : ${ENABLE_ASAN}")
 message(STATUS "  ORT             : ${ORT_LIBRARY}")
 message(STATUS "")

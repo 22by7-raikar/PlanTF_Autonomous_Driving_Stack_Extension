@@ -1,4 +1,5 @@
 import time
+import contextlib
 from typing import List, Optional, Type
 import os
 import csv
@@ -44,12 +45,16 @@ class ImitationPlanner(AbstractPlanner):
         replan_interval: int = 1,
         use_gpu: bool = True,
         record_latency: bool = False,
+        use_nvtx: bool = False,
     ) -> None:
         """
         Initializes the ML planner class.
         :param model: Model to use for inference.
         :param record_latency: If True, append per-step latency to
             benchmarks/mini_v1/latency.csv.  Default False (off in eval runs).
+        :param use_nvtx: If True, wrap each pipeline stage in an NVTX range.
+            Only effective when running under `nsys profile` with a CUDA device.
+            Safe to leave False in all normal evaluation runs.
         """
         if use_gpu:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -68,6 +73,13 @@ class ImitationPlanner(AbstractPlanner):
         self._last_plan_elapsed_step = replan_interval  # force plan at first step
         self._global_trajectory = None
         self._start_time = None
+
+        # NVTX profiling flag.  When True, each sub-stage of _planning() is
+        # wrapped in a named NVTX range visible in Nsight Systems.  The flag
+        # only takes effect when device==cuda; on CPU the push/pop calls are
+        # harmless no-ops but add a tiny amount of Python overhead, so it is
+        # safest to only set this during deliberate profiling runs.
+        self._use_nvtx = use_nvtx and (self.device.type == "cuda")
 
         # Runtime stats for the MLPlannerReport
         self._feature_building_runtimes: List[float] = []
@@ -115,32 +127,79 @@ class ImitationPlanner(AbstractPlanner):
         """Inherited, see superclass."""
         return DetectionsTracks  # type: ignore
 
+    # ------------------------------------------------------------------
+    # NVTX helper
+    # ------------------------------------------------------------------
+    # A tiny context manager so every call site reads
+    #   with self._nvtx("stage_name"):
+    # instead of repeating the if-guard.
+
+    @contextlib.contextmanager
+    def _nvtx(self, name: str):
+        if self._use_nvtx:
+            torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            if self._use_nvtx:
+                torch.cuda.nvtx.range_pop()
+
     def _planning(self, current_input: PlannerInput):
         planner_start = time.perf_counter()
 
-        feature_start = time.perf_counter()
-        planner_feature = self._planner_feature_builder.get_features_from_simulation(
-            current_input, self._initialization
-        )
-        planner_feature_torch = planner_feature.collate(
-            [planner_feature.to_feature_tensor().to_device(self.device)]
-        )
-        feature_end = time.perf_counter()
+        # ── Stage 1: feature building (CPU-side nuPlan preprocessing) ─────
+        # This is where the nuPlan SimulationHistory is read, agents and map
+        # polygons are extracted, normalised into ego-frame, and packaged as
+        # tensors.  It is 100% CPU work.  In Nsight Systems you will see this
+        # as dead GPU time — the GPU is idle while Python runs this code.
+        with self._nvtx("feature_build"):
+            feature_start = time.perf_counter()
+            planner_feature = self._planner_feature_builder.get_features_from_simulation(
+                current_input, self._initialization
+            )
+            feature_end = time.perf_counter()
+
+        # ── Stage 2: host-to-device transfer ─────────────────────────────
+        # .to_feature_tensor() converts numpy arrays to CPU torch tensors.
+        # .to_device(self.device) performs the actual H2D copy (cudaMemcpy
+        # under the hood).  With pageable (non-pinned) host memory, this
+        # copy must wait for the GPU to finish any outstanding work first,
+        # which can introduce a synchronization bubble.
+        with self._nvtx("h2d_transfer"):
+            planner_feature_torch = planner_feature.collate(
+                [planner_feature.to_feature_tensor().to_device(self.device)]
+            )
+
         feature_build_ms = (feature_end - feature_start) * 1000.0
         self._feature_building_runtimes.append(feature_end - feature_start)
 
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        forward_start = time.perf_counter()
+        # ── Stage 3: model forward pass (GPU compute) ─────────────────────
+        # This is the TRT/PyTorch GPU work.  The synchronize() calls around
+        # it ensure the CPU waits for the GPU to finish before we record the
+        # end time — without them, forward_ms would measure only the kernel
+        # launch latency, not the actual execution time.
+        with self._nvtx("model_forward"):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            forward_start = time.perf_counter()
 
-        out = self._planner.forward(planner_feature_torch.data)
+            out = self._planner.forward(planner_feature_torch.data)
 
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        forward_end = time.perf_counter()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            forward_end = time.perf_counter()
+
         forward_ms = (forward_end - forward_start) * 1000.0
 
-        local_trajectory = rerank_modes(out, planner_feature_torch.data)
+        # ── Stage 4: mode reranking (post-processing) ─────────────────────
+        # rerank_modes() selects the best of the 6 candidate trajectories
+        # by blending model probability with on-route coverage.  It currently
+        # runs as Python + torch.cdist in a for-loop (Phase 3 will fix this).
+        # On a GPU path this stage pulls data back to CPU and re-dispatches
+        # small torch ops, which shows up in Nsight as fragmented kernel
+        # launches after the main inference block.
+        with self._nvtx("rerank_modes"):
+            local_trajectory = rerank_modes(out, planner_feature_torch.data)
 
         planner_end = time.perf_counter()
         total_planner_ms = (planner_end - planner_start) * 1000.0

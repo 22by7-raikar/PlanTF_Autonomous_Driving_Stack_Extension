@@ -48,6 +48,7 @@ import argparse
 import sys
 import os
 import time
+import contextlib
 
 import numpy as np
 
@@ -176,6 +177,30 @@ def _metrics(a: np.ndarray, b: np.ndarray) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# NVTX helpers
+# ---------------------------------------------------------------------------
+# NVTX (NVIDIA Tools Extension) is a C/Python API for inserting named markers
+# into a profiling timeline.  When you run the program under `nsys profile`,
+# these markers show up as coloured bands in the Nsight Systems UI so you can
+# see exactly which part of the code was running at any moment.
+#
+# torch.cuda.nvtx is available in PyTorch 1.12 but only works when a CUDA
+# device is accessible.  We wrap it in a no-op context so CPU-only runs do not
+# need a guard at every call site.
+
+@contextlib.contextmanager
+def _nvtx_range(name: str, enabled: bool):
+    """Context manager that pushes/pops an NVTX range when enabled."""
+    if enabled:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        if enabled:
+            torch.cuda.nvtx.range_pop()
+
+
 def main():
     _default_ckpt = os.path.join(_repo_root, "checkpoints", "planTF.ckpt")
     parser = argparse.ArgumentParser()
@@ -185,7 +210,19 @@ def main():
     parser.add_argument("--polygons", type=int, default=152, help="Number of map polygons")
     parser.add_argument("--warmup", type=int, default=3,   help="Warmup forward passes")
     parser.add_argument("--runs",   type=int, default=10,  help="Timed forward passes")
+    parser.add_argument(
+        "--nvtx",
+        action="store_true",
+        help=(
+            "Insert NVTX range markers around each pipeline stage. "
+            "Only meaningful when running under `nsys profile --trace=nvtx`. "
+            "Requires --device cuda."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.nvtx and args.device != "cuda":
+        print("WARNING: --nvtx has no effect without --device cuda")
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA not available on this machine")
@@ -211,19 +248,43 @@ def main():
         else:
             print(f"  {k:32s} {str(v.shape):30s} {v.dtype}")
 
+    use_nvtx = args.nvtx and device.type == "cuda"
+
     with torch.no_grad():
-        # warmup
+        # ── Warmup (not profiled — let the GPU reach steady state first) ──────
         for _ in range(args.warmup):
             _ = model(data)
 
-        # timed runs
+        # ── Timed runs with NVTX ranges ──────────────────────────────────────
+        # Each run is wrapped in a top-level "plantf_forward" range so the
+        # global timeline shows individual iterations.  Inside that we have
+        # two sub-ranges:
+        #
+        #  h2d_transfer  — moving the input dict from CPU to GPU.  In this
+        #                  headless script the dummy tensors are already on the
+        #                  right device, so this range captures close-to-zero
+        #                  work.  In the live planner the equivalent range
+        #                  covers the real host-to-device copy.
+        #
+        #  model_forward — the actual GPU compute for PlanningModel.forward().
+        #                  The synchronize() calls before/after ensure the GPU
+        #                  has truly finished before we stop timing.
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(args.runs):
-            out = model(data)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+            with _nvtx_range("plantf_forward", use_nvtx):
+                with _nvtx_range("h2d_transfer", use_nvtx):
+                    # Dummy data is already on-device; this range is a
+                    # placeholder so the profiling structure matches the live
+                    # planner where a real H2D copy happens here.
+                    pass
+                with _nvtx_range("model_forward", use_nvtx):
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    out = model(data)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
         elapsed = (time.perf_counter() - t0) / args.runs * 1000
 
     print("\n=== Output shapes ===")
