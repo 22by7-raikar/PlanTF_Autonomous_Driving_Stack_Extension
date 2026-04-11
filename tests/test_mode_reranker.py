@@ -326,3 +326,131 @@ class TestNumericalStability:
         data = _make_data()
         result = rerank_modes(out, data)
         assert result.shape == (T, 3)
+
+
+# ── test: CUDA kernel ─────────────────────────────────────────────────────────
+
+def _cuda_ext_available() -> bool:
+    """Return True only when CUDA is present AND the extension compiles.
+
+    Evaluated once at collection time.  This catches two common CI/dev
+    scenarios:
+      - No GPU / CUDA not installed → torch.cuda.is_available() is False
+      - GPU present but Ninja / nvcc absent → _get_ext() returns None
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from src.planners.reranker_cuda import _get_ext  # noqa: PLC0415
+        return _get_ext() is not None
+    except Exception:
+        return False
+
+
+_CUDA_EXT_OK: bool = _cuda_ext_available()
+
+
+# Skip the whole class rather than each method individually to keep the output
+# tidy when CUDA is absent (CI, laptops without a GPU or without Ninja).
+@pytest.mark.skipif(
+    not _CUDA_EXT_OK,
+    reason="CUDA extension unavailable (CUDA absent or Ninja/compiler missing)",
+)
+class TestCudaKernelCoverage:
+    """Verify compute_coverage_cuda matches the PyTorch reference implementation.
+
+    Two levels of testing:
+      1. Isolated kernel test: compare coverage tensors directly.
+      2. Full pipeline: rerank_modes on GPU tensors must give the same
+         selected mode as rerank_modes on CPU tensors.
+    """
+
+    def test_cuda_kernel_matches_pytorch_reference(self):
+        """Isolated unit test: CUDA kernel output ≈ PyTorch loop output."""
+        torch.manual_seed(123)
+        K_, T_, R_ = K, T, 30
+        wp  = torch.randn(K_, T_, 2, device="cuda")
+        rc  = torch.randn(R_, 2, device="cuda")
+
+        # Reference: per-mode PyTorch loop (same as original reranker code)
+        ref = torch.zeros(K_, device="cuda")
+        for k in range(K_):
+            dists    = torch.cdist(wp[k], rc)             # [T, R]
+            min_d    = dists.min(dim=-1).values           # [T]
+            ref[k]   = (min_d <= ROUTE_DIST_THRESHOLD).float().mean()
+
+        # CUDA kernel
+        from src.planners.reranker_cuda import compute_coverage_cuda
+        cov = compute_coverage_cuda(wp.float(), rc.float(), ROUTE_DIST_THRESHOLD)
+        assert cov is not None, (
+            "CUDA extension returned None — check compilation output"
+        )
+
+        np.testing.assert_allclose(
+            cov.cpu().numpy(),
+            ref.cpu().numpy(),
+            atol=1e-5,
+            err_msg="CUDA kernel coverage differs from PyTorch reference",
+        )
+
+    def test_cuda_kernel_all_on_route(self):
+        """When all waypoints are at the origin and route centre = origin,
+        coverage must be 1.0 for every mode."""
+        from src.planners.reranker_cuda import compute_coverage_cuda
+        wp = torch.zeros(K, T, 2, device="cuda")      # all at origin
+        rc = torch.zeros(1, 2, device="cuda")          # route centre at origin
+        cov = compute_coverage_cuda(wp, rc, ROUTE_DIST_THRESHOLD)
+        assert cov is not None
+        np.testing.assert_allclose(
+            cov.cpu().numpy(), np.ones(K, dtype=np.float32), atol=1e-6,
+        )
+
+    def test_cuda_kernel_all_off_route(self):
+        """When all waypoints are 1e6 m from the route centre, coverage = 0."""
+        from src.planners.reranker_cuda import compute_coverage_cuda
+        wp = torch.ones(K, T, 2, device="cuda") * 1e6
+        rc = torch.zeros(1, 2, device="cuda")
+        cov = compute_coverage_cuda(wp, rc, ROUTE_DIST_THRESHOLD)
+        assert cov is not None
+        np.testing.assert_allclose(
+            cov.cpu().numpy(), np.zeros(K, dtype=np.float32), atol=1e-6,
+        )
+
+    def test_rerank_modes_gpu_matches_cpu(self):
+        """Full pipeline: rerank_modes with GPU tensors must select the same
+        mode as the CPU path (both use the reference PyTorch loop or kernel;
+        the selected trajectory xy should match to float tolerance)."""
+        torch.manual_seed(42)
+        traj = torch.randn(1, K, T, 4)
+        traj[..., 2:4] = torch.nn.functional.normalize(traj[..., 2:4], dim=-1)
+        prob    = torch.randn(1, K)
+        centers = torch.randn(1, M, 3) * 2.0
+        on_rte  = torch.ones(1, M, dtype=torch.bool)
+
+        # CPU run
+        result_cpu = rerank_modes(
+            _make_out(trajectory=traj.clone(), probability=prob.clone()),
+            _make_data(polygon_center=centers.clone(), polygon_on_route=on_rte),
+        )
+
+        # GPU run
+        result_gpu = rerank_modes(
+            _make_out(
+                trajectory=traj.cuda(),
+                probability=prob.cuda(),
+                output_trajectory=torch.zeros(1, T, 3, device="cuda"),
+            ),
+            _make_data(
+                polygon_center=centers.cuda(),
+                polygon_on_route=on_rte.cuda(),
+            ),
+        )
+
+        np.testing.assert_allclose(
+            result_cpu, result_gpu, atol=1e-4,
+            err_msg=(
+                "GPU reranker selected a different mode than CPU reranker. "
+                "Check that CUDA kernel coverage matches PyTorch."
+            ),
+        )
+

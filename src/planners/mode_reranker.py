@@ -108,14 +108,31 @@ def rerank_modes(
     route_centers = polygon_center[on_route_mask, :2]  # [R, 2]
 
     # ── per-mode coverage scores ───────────────────────────────────────────
+    # Fast path: CUDA kernel (see src/planners/reranker_cuda.py).
+    # The kernel launches one block per mode k; each block of 128 threads
+    # computes min-dist for one waypoint and reduces to a scalar coverage.
+    # Falls back transparently when CUDA is unavailable or tensors are on CPU.
     K = traj.shape[0]
     coverage = torch.zeros(K, dtype=torch.float32, device=traj.device)
 
-    for k in range(K):
-        waypoints = traj[k, :, :2]                              # [T, 2]
-        dists = torch.cdist(waypoints, route_centers)           # [T, R]
-        min_dists = dists.min(dim=-1).values                    # [T]
-        coverage[k] = (min_dists <= ROUTE_DIST_THRESHOLD).float().mean()
+    _cuda_cov: "torch.Tensor | None" = None
+    if traj.is_cuda:
+        from .reranker_cuda import compute_coverage_cuda  # noqa: PLC0415
+        _cuda_cov = compute_coverage_cuda(
+            traj[:, :, :2].float().contiguous(),       # [K, T, 2]
+            route_centers[:, :2].float().contiguous(), # [R, 2]
+            ROUTE_DIST_THRESHOLD,
+        )
+
+    if _cuda_cov is not None:
+        coverage = _cuda_cov
+    else:
+        # PyTorch fallback — also used when tensors are on CPU.
+        for k in range(K):
+            waypoints = traj[k, :, :2]                          # [T, 2]
+            dists = torch.cdist(waypoints, route_centers)       # [T, R]
+            min_dists = dists.min(dim=-1).values                # [T]
+            coverage[k] = (min_dists <= ROUTE_DIST_THRESHOLD).float().mean()
 
     # ── blended score and mode selection ──────────────────────────────────
     prob_norm = torch.softmax(prob, dim=-1)                     # [K]
