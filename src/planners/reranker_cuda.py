@@ -34,6 +34,71 @@ _ext: Optional[object] = None
 _tried: bool = False
 
 
+def _find_cuda_includes() -> list[str]:
+    """Return a list of include directories needed to compile the CUDA extension.
+
+    Resolves, in order:
+      1. ``site-packages/nvidia/cuda_runtime/include``  — ``cuda_runtime.h``
+      2. ``$CUDA_HOME/include`` / ``$CUDA_PATH/include``
+      3. Same candidates for ``thrust/complex.h`` (Thrust is part of the CUDA
+         toolkit but absent from the pip-installed cuda_runtime package).
+    """
+    import sysconfig  # noqa: PLC0415
+
+    includes: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        if path not in seen and os.path.isdir(path):
+            includes.append(path)
+            seen.add(path)
+
+    site_pkgs = sysconfig.get_paths()["purelib"]
+
+    # ── Candidate roots that may contain CUDA headers ────────────────────────
+    candidates: list[str] = []
+
+    # pip-installed nvidia packages (cuda_runtime, cuda_nvcc)
+    for pkg in ("cuda_runtime", "cuda_nvcc"):
+        candidates.append(os.path.join(site_pkgs, "nvidia", pkg, "include"))
+
+    # CUDA_HOME / CUDA_PATH env vars
+    for env_var in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_root = os.environ.get(env_var, "")
+        if cuda_root:
+            candidates.append(os.path.join(cuda_root, "include"))
+
+    # ── Add dirs that satisfy at least one of our known required headers ──────
+    required = {
+        "cuda_runtime.h": False,
+        os.path.join("thrust", "complex.h"): False,
+    }
+    for root in candidates:
+        for header in list(required.keys()):
+            if not required[header] and os.path.isfile(os.path.join(root, header)):
+                _add(root)
+                required[header] = True
+
+    # ── Fallback: check every readable CUDA include we can find on disk ───────
+    # This covers site-local CUDA installs (e.g. MATLAB's toolkit).
+    if not all(required.values()):
+        _fallback_roots = [
+            # MATLAB ships an almost-complete CUDA toolkit
+            "/home/apr/apps/MATLAB/R2025b/sys/cuda/glnxa64/cuda/include",
+            "/usr/local/cuda/include",
+            "/usr/cuda/include",
+        ]
+        for root in _fallback_roots:
+            for header in list(required.keys()):
+                if not required[header] and os.path.isfile(
+                    os.path.join(root, header)
+                ):
+                    _add(root)
+                    required[header] = True
+
+    return includes
+
+
 def _try_load() -> Optional[object]:
     """Attempt to JIT-compile and load the CUDA extension.
 
@@ -47,6 +112,20 @@ def _try_load() -> Optional[object]:
         from torch.utils.cpp_extension import load as _cpp_load  # noqa: PLC0415
 
         _here = os.path.dirname(os.path.abspath(__file__))
+
+        # Collect CUDA header directories that may live outside $CUDA_HOME
+        # (e.g. pip-installed cuda_runtime, MATLAB toolkit for Thrust).
+        extra_includes = _find_cuda_includes()
+
+        # Collect CUDA library directories needed for linking (-lcudart).
+        extra_ldflags: list[str] = []
+        import sysconfig  # noqa: PLC0415
+
+        site_pkgs = sysconfig.get_paths()["purelib"]
+        cudart_lib = os.path.join(site_pkgs, "nvidia", "cuda_runtime", "lib")
+        if os.path.isfile(os.path.join(cudart_lib, "libcudart.so")):
+            extra_ldflags.append(f"-L{cudart_lib}")
+
         ext = _cpp_load(
             name="reranker_cuda_ext",
             sources=[os.path.join(_here, "reranker_cuda_kernel.cu")],
@@ -55,6 +134,8 @@ def _try_load() -> Optional[object]:
             #              (reciprocal, sqrt) which aren't needed here but
             #              the flag also enables fused FP ops globally.
             extra_cuda_cflags=["-O2", "--use_fast_math"],
+            extra_include_paths=extra_includes,
+            extra_ldflags=extra_ldflags,
         )
         return ext
     except Exception as exc:
