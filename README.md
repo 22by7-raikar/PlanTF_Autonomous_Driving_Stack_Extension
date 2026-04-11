@@ -33,7 +33,7 @@ Three independent tracks built on top of the published PlanTF checkpoint (no ret
 | [TensorRT + C++ runtime](#tensorrt-and-c-runtime) | 1.2–1.7 ms (TRT FP16/FP32) vs ~20 ms CPU Python; patched model only (see note) |
 | [INT8 post-training quantisation](#int8-quantisation) | Calibrated INT8 TRT engine; full calibration + validation pipeline |
 | [C++ runtime optimisations](#tensorrt-and-c-runtime) | Pinned memory + async H2D/D2H; per-stage (H2D/kernel/D2H) CUDA event timers |
-| [CUDA reranker kernel](#geometric-mode-re-ranking) | Custom CUDA kernel replaces Python coverage loop; ~3–6× speedup |
+| [CUDA reranker kernel](#geometric-mode-re-ranking) | Custom CUDA kernel replaces Python coverage loop; **13.7× vs CPU loop, 32.2× vs GPU PyTorch loop** (RTX 3060, K=6 T=80 R=30) |
 
 CI: lint, 16 unit tests, C++ ORT build — runs on every push/PR.
 
@@ -337,11 +337,19 @@ score[k] = (1 − λ) · softmax(prob)[k]  +  λ · coverage[k]
 
 λ=0.3 was chosen based on a 21-scenario TL-intersection eval where it produced the best directional result among {0.1, 0.2, 0.3} tested by hand. A full grid search on the 84-scenario benchmark was not run: each run takes ~20 min, so a 5-point sweep would cost ~1.5 hours. λ=0.3 is an initial working value, not a tuned optimum.
 
-Results on mini_eval_v2 (84 scenarios): main gain in `stop_and_go` (+0.036), `intersections` unchanged, small regression in `pedestrian` (−0.009), net +0.77%. See [Results](#this-fork--mini_eval_v2-84-scenarios-nr-cls) for the full bucket breakdown. Unit tests: `tests/test_mode_reranker.py` (16 tests, 4 CUDA tests skipped when GPU absent).
+Results on mini_eval_v2 (84 scenarios): main gain in `stop_and_go` (+0.036), `intersections` unchanged, small regression in `pedestrian` (−0.009), net +0.77%. See [Results](#this-fork--mini_eval_v2-84-scenarios-nr-cls) for the full bucket breakdown. Unit tests: `tests/test_mode_reranker.py` (**20 passed**, 4 CUDA tests run when GPU + Ninja + nvcc are available, skipped otherwise).
 
 #### CUDA kernel for coverage computation (`feature/cuda-reranker`)
 
-`rerank_modes` now uses a fused CUDA kernel (`src/planners/reranker_cuda_kernel.cu`) when tensors are on GPU, falling back to the PyTorch loop transparently on CPU or when the extension can't compile. The kernel layout — `Grid(K) × Block(128)`, one thread per waypoint, shared-memory tree reduction — fuses the K-loop, T-loop, and R-scan into a single GPU launch. Expected speedup vs the CPU PyTorch loop: ~3–6× (measured via `benchmarks/bench_reranker.py`). The extension is compiled on first GPU call via `torch.utils.cpp_extension.load` and cached in `~/.cache/torch_extensions/`.
+`rerank_modes` now uses a fused CUDA kernel (`src/planners/reranker_cuda_kernel.cu`) when tensors are on GPU, falling back to the PyTorch loop transparently on CPU or when the extension can't compile. The kernel layout — `Grid(K) × Block(128)`, one thread per waypoint, shared-memory tree reduction — fuses the K-loop, T-loop, and R-scan into a single GPU launch. Measured on RTX 3060 Laptop, K=6 T=80 R=30, 500 runs (`benchmarks/bench_reranker.py`):
+
+| Backend | Mean latency | Speedup vs CPU |
+|---|---|---|
+| CPU PyTorch loop | 0.351 ms | 1× |
+| GPU PyTorch loop | 0.827 ms | 0.43× |
+| **GPU CUDA kernel** | **0.026 ms** | **13.7×** |
+
+Speedup vs GPU PyTorch loop: **32.2×**. Max |kernel − ref| = 0.00e+00 (bit-exact on float32). The extension is compiled on first GPU call via `torch.utils.cpp_extension.load` and cached in `~/.cache/torch_extensions/`. On machines without a standard `$CUDA_HOME`, the loader auto-discovers `cuda_runtime.h` from the pip-installed `nvidia-cuda-runtime-cu11` package and Thrust headers from any available CUDA toolkit.
 
 **Failure analysis.** The four zero-score TL intersection scenarios that motivated this work, captured from nuboard:
 

@@ -14,7 +14,7 @@ inference-extensions  ─── stable base for the five 2026-04 feature branche
   feature/reranker-vectorization  (commit c593f62)
   feature/int8-ptq                (commit d521733)
   feature/cpp-runtime-optimizations (commit cd80b75)
-  feature/cuda-reranker           (commit 3584513)
+  feature/cuda-reranker           (commit d64b8fa)
 ```
 
 ---
@@ -170,8 +170,8 @@ Changes:
   single `cudaStreamSynchronize` per iteration; per-stage latency table
 
 ### `feature/cuda-reranker` — CUDA kernel for coverage computation
-**Purpose**: Replace the Python coverage loop with a fused CUDA kernel,
-giving ~3–6× speedup over the CPU PyTorch path.
+**Purpose**: Replace the Python coverage loop with a fused CUDA kernel.
+Measured speedup on RTX 3060 Laptop: **13.7× vs CPU loop, 32.2× vs GPU PyTorch loop**.
 
 Files added/modified:
 - `src/planners/reranker_cuda_kernel.cu` (new) — kernel layout: Grid(K) ×
@@ -184,9 +184,9 @@ Files added/modified:
 - `src/planners/mode_reranker.py` — fast path: `compute_coverage_cuda()` if
   `traj.is_cuda`, else PyTorch loop
 - `tests/test_mode_reranker.py` — `TestCudaKernelCoverage` (4 tests, skipped
-  when CUDA/Ninja absent); corrected `_cuda_ext_available()` skip guard
+  when CUDA/Ninja/nvcc absent); **20/20 pass** when GPU available
 - `benchmarks/bench_reranker.py` — 3-way benchmark: CPU loop / GPU loop /
-  CUDA kernel (CUDA events, 500 runs)
+  CUDA kernel (CUDA events, 500 runs); RTX 3060: CPU 0.351 ms → kernel 0.026 ms
 
 ---
 
