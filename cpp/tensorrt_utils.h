@@ -4,12 +4,14 @@
  * Shared utilities for planTF TensorRT C++ inference.
  *
  * Provides:
- *   TRTLogger         — ILogger adapter with configurable severity
- *   EngineBuffer      — per-binding host+device allocation
- *   fill_dummy_inputs — constant-fill inputs from engine binding info
- *   cuda_event_ms     — measure elapsed time between two cudaEvents
- *   percentile        — percentile over a vector of doubles
- *   print_latency     — formatted latency report to stdout
+ *   TRTLogger             — ILogger adapter with configurable severity
+ *   EngineBuffer          — per-binding host+device allocation
+ *                           (supports page-locked host memory via cudaMallocHost)
+ *   alloc_engine_buffers  — allocate + constant-fill all I/O buffers
+ *   cuda_event_ms         — measure elapsed time between two cudaEvents
+ *   percentile            — percentile over a vector of doubles
+ *   print_latency         — formatted latency report to stdout
+ *   print_latency_stages  — per-stage (H2D / Kernel / D2H) breakdown table
  *
  * Requires: NvInfer.h, NvOnnxParser.h, cuda_runtime_api.h
  */
@@ -75,16 +77,31 @@ struct EngineBuffer {
     void*                     device_ptr = nullptr;
     void*                     host_ptr   = nullptr;
     int64_t                   nbytes     = 0;
+    bool                      pinned     = false;  // true → cudaMallocHost
 
-    void alloc() {
+    // use_pinned=true: page-locked (pinned) host allocation.
+    // Pinned memory is required for cudaMemcpyAsync to be genuinely
+    // asynchronous — with pageable memory CUDA silently falls back to
+    // synchronous DMA, defeating the purpose.  Pinned memory also
+    // raises H2D/D2H bandwidth by ~30–50 % on typical desktop GPUs.
+    void alloc(bool use_pinned = false) {
         CUDA_CHECK(cudaMalloc(&device_ptr, nbytes));
-        host_ptr = std::malloc(nbytes);
-        assert(host_ptr);
+        if (use_pinned) {
+            CUDA_CHECK(cudaMallocHost(&host_ptr, nbytes));
+            pinned = true;
+        } else {
+            host_ptr = std::malloc(nbytes);
+            assert(host_ptr);
+        }
     }
 
     void free_all() {
         if (device_ptr) { cudaFree(device_ptr); device_ptr = nullptr; }
-        if (host_ptr)   { std::free(host_ptr);  host_ptr   = nullptr; }
+        if (host_ptr) {
+            if (pinned) { CUDA_CHECK(cudaFreeHost(host_ptr)); }
+            else        { std::free(host_ptr); }
+            host_ptr = nullptr;
+        }
     }
 
     bool is_input()  const { return io_mode == nvinfer1::TensorIOMode::kINPUT; }
@@ -125,7 +142,8 @@ inline std::vector<int64_t> dims_to_vec(const nvinfer1::Dims& d) {
 //   output_trajectory[:,:6] = [-0.239406, 0.085293, 0.005405, ...]
 std::vector<EngineBuffer> alloc_engine_buffers(
         const nvinfer1::ICudaEngine* engine,
-        bool verbose = false);
+        bool verbose    = false,
+        bool use_pinned = false);
 
 // ── CUDA event elapsed time (ms) ────────────────────────────────────────────
 inline float cuda_event_ms(cudaEvent_t start, cudaEvent_t stop) {
@@ -165,4 +183,39 @@ inline void print_latency(const std::vector<double>& times_ms,
     std::cout << "  max  : " << maxv << "\n";
     std::cout << "  QPS  : " << qps  << "\n";
     std::cout << "────────────────────────────────────────────────\n";
+}
+
+// ── Per-stage latency breakdown: H2D | Kernel | D2H | Total ─────────────────
+// Call after the timed loop to print a 4-row breakdown table.
+inline void print_latency_stages(
+        const std::vector<double>& h2d_ms,
+        const std::vector<double>& kernel_ms,
+        const std::vector<double>& d2h_ms) {
+    if (h2d_ms.empty()) return;
+    size_t n = h2d_ms.size();
+
+    std::vector<double> total_ms(n);
+    for (size_t i = 0; i < n; ++i)
+        total_ms[i] = h2d_ms[i] + kernel_ms[i] + d2h_ms[i];
+
+    auto mean_of = [](const std::vector<double>& v) -> double {
+        return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+    };
+
+    std::cout << "\n────────────────────────────────────────────────────────\n";
+    std::cout << "  Per-stage breakdown (ms, CUDA event timing)\n";
+    std::cout << "  stage     mean     p50      p99\n";
+    std::cout << "  H2D    :  " << mean_of(h2d_ms)
+              << "   " << percentile(h2d_ms,    50.0)
+              << "   " << percentile(h2d_ms,    99.0) << "\n";
+    std::cout << "  Kernel :  " << mean_of(kernel_ms)
+              << "   " << percentile(kernel_ms, 50.0)
+              << "   " << percentile(kernel_ms, 99.0) << "\n";
+    std::cout << "  D2H    :  " << mean_of(d2h_ms)
+              << "   " << percentile(d2h_ms,    50.0)
+              << "   " << percentile(d2h_ms,    99.0) << "\n";
+    std::cout << "  Total  :  " << mean_of(total_ms)
+              << "   " << percentile(total_ms,  50.0)
+              << "   " << percentile(total_ms,  99.0) << "\n";
+    std::cout << "────────────────────────────────────────────────────────\n";
 }

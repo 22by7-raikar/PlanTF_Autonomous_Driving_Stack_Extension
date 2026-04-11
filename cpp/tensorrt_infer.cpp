@@ -7,11 +7,17 @@
  *   1. Load engine cache (inference/planTF.trt or planTF_fp32.trt) if present.
  *   2. If cache absent or --rebuild: parse inference/planTF.onnx and build
  *      a new engine (slow, ~1–5 min on first build).
- *   3. Allocate I/O buffers via alloc_engine_buffers(); fill inputs with safe
- *      constants (float=0.1, int=0, bool=false) — avoids Gather OOB errors.
- *   4. Run warmup iterations, then timed iterations using CUDA events.
- *   5. Print latency table (mean/p50/p95/p99/max/QPS).
- *   6. Copy output to host and print first 6 values for comparison.
+ *   3. Allocate I/O buffers via alloc_engine_buffers(use_pinned=true):
+ *      page-locked host memory (cudaMallocHost) is required for async DMA.
+ *      Inputs are constant-filled (float=0.1, int=0, bool=false).
+ *   4. Run warmup iterations (kernel only), then timed iterations.
+ *      Each timed iteration records 3 CUDA event pairs around:
+ *        Stage 1: H2D async transfer of all input tensors
+ *        Stage 2: enqueueV3 (TRT kernel)
+ *        Stage 3: D2H async transfer of all output tensors
+ *      cudaStreamSynchronize is called once per iteration.
+ *   5. Print kernel latency table (mean/p50/p95/p99/max/QPS) and
+ *      per-stage breakdown (H2D / Kernel / D2H / Total).
  *
  * Expected output (RTX 3060, batch=1):
  *   FP16 engine: mean ~1.1 ms, QPS ~900
@@ -181,19 +187,33 @@ int main(int argc, char* argv[]) {
         engine->createExecutionContext());
     if (!context) throw std::runtime_error("createExecutionContext failed");
 
-    // ── Allocate I/O buffers (constant-fill via alloc_engine_buffers) ────────
+    // ── Allocate I/O buffers (pinned host memory for async H2D/D2H) ────────────
+    // use_pinned=true: cudaMallocHost gives page-locked host memory.
+    // This is required for cudaMemcpyAsync to actually be asynchronous;
+    // pageable memory forces CUDA to stage through a locked bounce buffer
+    // anyway (synchronously), so pinned memory also improves raw bandwidth.
     std::cout << "  IO tensors: " << engine->getNbIOTensors() << "\n";
-    auto buffers = alloc_engine_buffers(engine.get(), args.verbose);
+    auto buffers = alloc_engine_buffers(engine.get(), args.verbose, /*use_pinned=*/true);
     for (auto& buf : buffers)
         context->setTensorAddress(buf.name.c_str(), buf.device_ptr);
 
-    // ── CUDA stream + events ─────────────────────────────────────────────────
+    // ── CUDA stream + per-stage events ──────────────────────────────────────
+    // We create 3 event pairs around each pipeline stage so we can break
+    // down total latency into H2D transfer / TRT kernel / D2H transfer.
+    // cudaEventRecord enqueues the timestamp into the stream — events are
+    // measured entirely on the GPU side with ~2 µs resolution.
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_CHECK(cudaEventCreate(&ev_start));
-    CUDA_CHECK(cudaEventCreate(&ev_stop));
+    cudaEvent_t ev_h2d_s, ev_h2d_e;  // host-to-device transfer
+    cudaEvent_t ev_ker_s,  ev_ker_e;  // TRT enqueueV3 kernel
+    cudaEvent_t ev_d2h_s,  ev_d2h_e;  // device-to-host transfer
+    CUDA_CHECK(cudaEventCreate(&ev_h2d_s));
+    CUDA_CHECK(cudaEventCreate(&ev_h2d_e));
+    CUDA_CHECK(cudaEventCreate(&ev_ker_s));
+    CUDA_CHECK(cudaEventCreate(&ev_ker_e));
+    CUDA_CHECK(cudaEventCreate(&ev_d2h_s));
+    CUDA_CHECK(cudaEventCreate(&ev_d2h_e));
 
     // ── Warmup ───────────────────────────────────────────────────────────────
     std::cout << "\nWarmup (" << args.warmup << " runs)..." << std::flush;
@@ -204,31 +224,73 @@ int main(int argc, char* argv[]) {
     std::cout << " done\n";
 
     // ── Timed runs ───────────────────────────────────────────────────────────
-    std::cout << "Timing (" << args.runs << " runs, CUDA events)..." << std::flush;
-    std::vector<double> times;
-    times.reserve(args.runs);
+    // Each iteration records 3 event pairs around:
+    //   Stage 1: H2D — async copy of all input tensors into the stream
+    //   Stage 2: Kernel — enqueueV3 submits all TRT layers into the stream
+    //   Stage 3: D2H — async copy of all output tensors back to host
+    // After all three submits we call cudaStreamSynchronize once so the
+    // GPU only stalls the CPU at the very end of the pipeline, not between
+    // stages.  cudaEventElapsedTime then reads the GPU timestamps.
+    std::cout << "Timing (" << args.runs << " runs, CUDA events, per-stage)..." << std::flush;
+    std::vector<double> times_h2d, times_ker, times_d2h;
+    times_h2d.reserve(args.runs);
+    times_ker.reserve(args.runs);
+    times_d2h.reserve(args.runs);
 
     for (int i = 0; i < args.runs; ++i) {
-        CUDA_CHECK(cudaEventRecord(ev_start, stream));
+        // Stage 1: H2D (async, inputs only)
+        // cudaMemcpyAsync returns immediately; the DMA engine handles the
+        // transfer in the background while the CPU records the next event.
+        CUDA_CHECK(cudaEventRecord(ev_h2d_s, stream));
+        for (auto& buf : buffers) {
+            if (!buf.is_input()) continue;
+            CUDA_CHECK(cudaMemcpyAsync(
+                buf.device_ptr, buf.host_ptr,
+                static_cast<size_t>(buf.nbytes),
+                cudaMemcpyHostToDevice, stream));
+        }
+        CUDA_CHECK(cudaEventRecord(ev_h2d_e, stream));
+
+        // Stage 2: TRT kernel
+        // enqueueV3 appends all network layers to the stream — they will
+        // execute after all H2D transfers in this stream complete.
+        CUDA_CHECK(cudaEventRecord(ev_ker_s, stream));
         context->enqueueV3(stream);
-        CUDA_CHECK(cudaEventRecord(ev_stop, stream));
-        CUDA_CHECK(cudaEventSynchronize(ev_stop));
-        float ms = 0.f;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-        times.push_back(static_cast<double>(ms));
+        CUDA_CHECK(cudaEventRecord(ev_ker_e, stream));
+
+        // Stage 3: D2H (async, outputs only)
+        // Similarly, these launches are serialised in-stream so they wait
+        // for the kernel to finish before starting transfer.
+        CUDA_CHECK(cudaEventRecord(ev_d2h_s, stream));
+        for (auto& buf : buffers) {
+            if (!buf.is_output()) continue;
+            CUDA_CHECK(cudaMemcpyAsync(
+                buf.host_ptr, buf.device_ptr,
+                static_cast<size_t>(buf.nbytes),
+                cudaMemcpyDeviceToHost, stream));
+        }
+        CUDA_CHECK(cudaEventRecord(ev_d2h_e, stream));
+
+        // Single sync point — CPU waits only here, not between stages.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        times_h2d.push_back(static_cast<double>(cuda_event_ms(ev_h2d_s, ev_h2d_e)));
+        times_ker.push_back(static_cast<double>(cuda_event_ms(ev_ker_s,  ev_ker_e)));
+        times_d2h.push_back(static_cast<double>(cuda_event_ms(ev_d2h_s,  ev_d2h_e)));
     }
     std::cout << " done\n";
 
     // ── Results ──────────────────────────────────────────────────────────────
     std::string label = args.fp32 ? "TRT FP32" : "TRT FP16";
-    print_latency(times, label);
+    print_latency(times_ker, label + " kernel");
+    print_latency_stages(times_h2d, times_ker, times_d2h);
 
-    // ── Copy outputs to host and print ───────────────────────────────────────
+    // ── Print output tensor values ────────────────────────────────────────────
+    // D2H was performed inside the timed loop, so host_ptr already holds
+    // the final output — no extra memcpy needed here.
     std::cout << "\nOutput tensors:\n";
     for (auto& buf : buffers) {
         if (!buf.is_output()) continue;
-        CUDA_CHECK(cudaMemcpy(buf.host_ptr, buf.device_ptr,
-            static_cast<size_t>(buf.nbytes), cudaMemcpyDeviceToHost));
         std::cout << "  " << buf.name << "  shape=[";
         for (size_t d = 0; d < buf.shape.size(); ++d)
             std::cout << (d?",":"") << buf.shape[d];
@@ -250,8 +312,12 @@ int main(int argc, char* argv[]) {
     std::cout << "            FP16 may diverge ~59mm (see CPP_RUNTIME_REPORT.md)\n";
 
     // ── Cleanup ────────────────────────────────────────────────────────────
-    CUDA_CHECK(cudaEventDestroy(ev_start));
-    CUDA_CHECK(cudaEventDestroy(ev_stop));
+    CUDA_CHECK(cudaEventDestroy(ev_h2d_s));
+    CUDA_CHECK(cudaEventDestroy(ev_h2d_e));
+    CUDA_CHECK(cudaEventDestroy(ev_ker_s));
+    CUDA_CHECK(cudaEventDestroy(ev_ker_e));
+    CUDA_CHECK(cudaEventDestroy(ev_d2h_s));
+    CUDA_CHECK(cudaEventDestroy(ev_d2h_e));
     CUDA_CHECK(cudaStreamDestroy(stream));
     for (auto& buf : buffers) buf.free_all();
 

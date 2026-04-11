@@ -14,7 +14,8 @@
 // ── Allocate all engine I/O buffers with constant-fill for inputs ────────────
 std::vector<EngineBuffer> alloc_engine_buffers(
         const nvinfer1::ICudaEngine* engine,
-        bool verbose) {
+        bool verbose,
+        bool use_pinned) {
     int nb = engine->getNbIOTensors();
     std::vector<EngineBuffer> buffers(nb);
 
@@ -32,8 +33,8 @@ std::vector<EngineBuffer> alloc_engine_buffers(
         int64_t n          = numel(dims);
         buffers[i].nbytes  = n * dtype_bytes(dtype);
 
-        // Allocate
-        buffers[i].alloc();
+        // Allocate (pinned host memory when use_pinned=true)
+        buffers[i].alloc(use_pinned);
 
         // Fill inputs with safe constant values
         if (iomode == nvinfer1::TensorIOMode::kINPUT) {
