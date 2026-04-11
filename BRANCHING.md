@@ -8,6 +8,13 @@ main  ────────────────────────�
   (cpp-runtime     merged March 2026, commit 93b367b)
   (onnx-deployment legacy, content in inference/)
   (faithful-natten legacy, content in inference/faithful/)
+
+inference-extensions  ─── stable base for the five 2026-04 feature branches below
+  feature/nvtx-nsys               (commit b749d40)
+  feature/reranker-vectorization  (commit c593f62)
+  feature/int8-ptq                (commit d521733)
+  feature/cpp-runtime-optimizations (commit cd80b75)
+  feature/cuda-reranker           (commit 3584513)
 ```
 
 ---
@@ -87,6 +94,14 @@ Phase 1:  expanded-eval   → main  [MERGED March 2026, commit 46792b4]
 Phase 2:  cpp-runtime     → main  [MERGED March 2026, commit 93b367b]
 Phase 3:  faithful-natten         [legacy — content lives in inference/faithful/;
                                    no formal merge commit; FIDELITY_REPORT.md is the record]
+
+Phase 4 (pending, April 2026 — all branch from inference-extensions):
+  4a: feature/nvtx-nsys               → inference-extensions
+  4b: feature/reranker-vectorization  → inference-extensions
+  4c: feature/int8-ptq                → inference-extensions
+  4d: feature/cpp-runtime-optimizations → inference-extensions
+  4e: feature/cuda-reranker           → inference-extensions
+  then: inference-extensions          → main
 ```
 
 Merge policy:
@@ -97,6 +112,81 @@ git merge --no-ff cpp-runtime     -m "merge: native C++ ORT + TRT inference"
 ```
 
 Never fast-forward merge to main — the merge commit is the audit trail.
+
+---
+
+## April 2026 Feature Branches
+
+All five branch from `inference-extensions` (stable base, commit `ce31a6a`).
+Each is a single commit with a complete, independently reviewable change.
+
+### `feature/nvtx-nsys` — GPU profiling instrumentation
+**Purpose**: Add NVTX range markers so `nsys profile` shows per-stage GPU
+timelines. Prerequisite for data-driven optimisation decisions.
+
+Files added/modified:
+- `inference/run_pipeline.py` — NVTX ranges around feature build / TRT forward / reranker
+- `inference/imitation_planner.py` — NVTX ranges around Python planner stages
+- `inference/deploy/benchmark_tensorrt.py` — NVTX ranges in Python TRT benchmark
+- `cpp/tensorrt_infer.cpp` — NVTX macros + restructured timed loop
+- `cpp/tensorrt_utils.h` — `#define NVTX_*` macros (compile-time enabled via `-DENABLE_NVTX`)
+- `script/profile_nsys.sh` — one-shot `nsys profile` launcher
+- `.gitignore` — ignore `*.nsys-rep`, `*.sqlite`
+
+### `feature/reranker-vectorization` — Coverage loop vectorisation
+**Purpose**: Replace the Python `for k in range(K)` loop in `rerank_modes`
+with a single batched `torch.cdist([K*T,2],[R,2])` call. 2.84× CPU speedup,
+bit-exact output.
+
+Files modified:
+- `src/planners/mode_reranker.py` — vectorised inner loop
+- `tests/test_mode_reranker.py` — 3 new `TestVectorizedMatchesLooped` tests
+- `benchmarks/bench_reranker.py` — benchmark comparing looped vs vectorised
+
+### `feature/int8-ptq` — TensorRT INT8 post-training quantisation
+**Purpose**: Calibrate and benchmark an INT8 TRT engine via entropy
+calibration. Adds the full pipeline: calibration data generation, calibrator
+class, CLI flags, and validation script updates.
+
+Files added/modified:
+- `inference/deploy/dump_calibration_data.py` (new) — generates 512 `.npy`
+  calibration batches (23 input tensors each, synthetic constant-fill)
+- `inference/deploy/benchmark_tensorrt.py` — `_PlanTFCalibrator`, `--int8`,
+  `--calib-dir`, `--calib-cache` CLI args, INT8 benchmark block
+- `cpp/validate_outputs.py` — `--int8-engine` arg, INT8 comparison section
+- `.gitignore` — `inference/calib_data/`, `*.trt.cache`
+
+### `feature/cpp-runtime-optimizations` — Pinned memory + async DMA + per-stage timers
+**Purpose**: Reduce H2D/D2H transfer cost and expose per-stage timing.
+
+Changes:
+- `cpp/tensorrt_utils.h` — `EngineBuffer::alloc(bool use_pinned)` uses
+  `cudaMallocHost` for page-locked host memory; `free_all()` uses
+  `cudaFreeHost`; added `print_latency_stages(h2d, kernel, d2h)` helper
+- `cpp/tensorrt_utils.cpp` — `alloc_engine_buffers` gains `bool use_pinned`
+  parameter
+- `cpp/tensorrt_infer.cpp` — timed loop restructured: 3 × 2 CUDA event
+  pairs (H2D / kernel / D2H); `cudaMemcpyAsync` for all transfers;
+  single `cudaStreamSynchronize` per iteration; per-stage latency table
+
+### `feature/cuda-reranker` — CUDA kernel for coverage computation
+**Purpose**: Replace the Python coverage loop with a fused CUDA kernel,
+giving ~3–6× speedup over the CPU PyTorch path.
+
+Files added/modified:
+- `src/planners/reranker_cuda_kernel.cu` (new) — kernel layout: Grid(K) ×
+  Block(128); each thread handles one waypoint, scans R centres for min
+  squared distance; shared-memory tree reduction; BLOCK_T=128 (power-of-two
+  required for reduction correctness)
+- `src/planners/reranker_cuda.py` (new) — lazy JIT-loader via
+  `torch.utils.cpp_extension.load`; returns `None` on failure (no Ninja,
+  no GPU) for transparent fallback
+- `src/planners/mode_reranker.py` — fast path: `compute_coverage_cuda()` if
+  `traj.is_cuda`, else PyTorch loop
+- `tests/test_mode_reranker.py` — `TestCudaKernelCoverage` (4 tests, skipped
+  when CUDA/Ninja absent); corrected `_cuda_ext_available()` skip guard
+- `benchmarks/bench_reranker.py` — 3-way benchmark: CPU loop / GPU loop /
+  CUDA kernel (CUDA events, 500 runs)
 
 ---
 

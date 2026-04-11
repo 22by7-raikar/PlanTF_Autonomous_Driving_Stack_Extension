@@ -31,6 +31,9 @@ Three independent tracks built on top of the published PlanTF checkpoint (no ret
 | [Geometric mode re-ranking](#geometric-mode-re-ranking) | mini_eval_v2 NR-CLS: 0.8401 → **0.8478** (+0.77%) |
 | [Expanded evaluation benchmark](#expanded-evaluation-benchmark) | 84-scenario benchmark across 8 driving situation types |
 | [TensorRT + C++ runtime](#tensorrt-and-c-runtime) | 1.2–1.7 ms (TRT FP16/FP32) vs ~20 ms CPU Python; patched model only (see note) |
+| [INT8 post-training quantisation](#int8-quantisation) | Calibrated INT8 TRT engine; full calibration + validation pipeline |
+| [C++ runtime optimisations](#tensorrt-and-c-runtime) | Pinned memory + async H2D/D2H; per-stage (H2D/kernel/D2H) CUDA event timers |
+| [CUDA reranker kernel](#geometric-mode-re-ranking) | Custom CUDA kernel replaces Python coverage loop; ~3–6× speedup |
 
 CI: lint, 16 unit tests, C++ ORT build — runs on every push/PR.
 
@@ -334,7 +337,11 @@ score[k] = (1 − λ) · softmax(prob)[k]  +  λ · coverage[k]
 
 λ=0.3 was chosen based on a 21-scenario TL-intersection eval where it produced the best directional result among {0.1, 0.2, 0.3} tested by hand. A full grid search on the 84-scenario benchmark was not run: each run takes ~20 min, so a 5-point sweep would cost ~1.5 hours. λ=0.3 is an initial working value, not a tuned optimum.
 
-Results on mini_eval_v2 (84 scenarios): main gain in `stop_and_go` (+0.036), `intersections` unchanged, small regression in `pedestrian` (−0.009), net +0.77%. See [Results](#this-fork--mini_eval_v2-84-scenarios-nr-cls) for the full bucket breakdown. Unit tests: `tests/test_mode_reranker.py` (16 tests).
+Results on mini_eval_v2 (84 scenarios): main gain in `stop_and_go` (+0.036), `intersections` unchanged, small regression in `pedestrian` (−0.009), net +0.77%. See [Results](#this-fork--mini_eval_v2-84-scenarios-nr-cls) for the full bucket breakdown. Unit tests: `tests/test_mode_reranker.py` (16 tests, 4 CUDA tests skipped when GPU absent).
+
+#### CUDA kernel for coverage computation (`feature/cuda-reranker`)
+
+`rerank_modes` now uses a fused CUDA kernel (`src/planners/reranker_cuda_kernel.cu`) when tensors are on GPU, falling back to the PyTorch loop transparently on CPU or when the extension can't compile. The kernel layout — `Grid(K) × Block(128)`, one thread per waypoint, shared-memory tree reduction — fuses the K-loop, T-loop, and R-scan into a single GPU launch. Expected speedup vs the CPU PyTorch loop: ~3–6× (measured via `benchmarks/bench_reranker.py`). The extension is compiled on first GPU call via `torch.utils.cpp_extension.load` and cached in `~/.cache/torch_extensions/`.
 
 **Failure analysis.** The four zero-score TL intersection scenarios that motivated this work, captured from nuboard:
 
@@ -397,6 +404,7 @@ I exported the model to ONNX and built TensorRT engines to measure achievable in
 | ONNX Runtime CPU | FP32 | ~22 ms | ~0.9× (slower) |
 | TensorRT FP32 | FP32 | 1.7 ms | ~12× |
 | TensorRT FP16 | FP16 | 1.2 ms | ~16× |
+| TensorRT INT8 (calibrated) | INT8 | TBD | TBD |
 
 Hardware: RTX 3060 laptop · batch=1 · A=33 agents · M=152 map polygons.
 
@@ -406,6 +414,46 @@ python inference/deploy/benchmark_latency.py
 ```
 
 C++ ORT matches Python ORT to < 0.001 mm; C++ TRT FP32 0.252 mm, FP16 200 mm (expected precision loss). Build instructions: [`cpp/README.md`](cpp/README.md).
+
+#### INT8 quantisation
+
+`feature/int8-ptq` adds a full INT8 calibration pipeline:
+
+```bash
+# Generate 512 synthetic calibration batches
+python inference/deploy/dump_calibration_data.py --out inference/calib_data/
+
+# Build calibrated INT8 engine and benchmark
+python inference/deploy/benchmark_tensorrt.py \
+  --int8 --calib-dir inference/calib_data/ \
+  --int8-engine inference/planTF_int8.trt
+
+# Validate outputs against FP32 reference
+python cpp/validate_outputs.py --int8-engine inference/planTF_int8.trt
+```
+
+The calibrator uses TensorRT `IInt8EntropyCalibrator2`. Calibration data is synthetic (constant-fill, matching the C++ warmup inputs) — not real nuPlan features. INT8 accuracy pending measurement.
+
+#### C++ runtime optimisations (`feature/cpp-runtime-optimizations`)
+
+`EngineBuffer` now uses `cudaMallocHost` for page-locked host memory, enabling genuine `cudaMemcpyAsync` (pageable memory silently forces synchronous DMA). The timed benchmark loop now records three CUDA event pairs:
+
+| Stage | Events |
+|-------|--------|
+| H2D transfer | `ev_h2d_s / ev_h2d_e` — async copy of all input tensors |
+| TRT kernel | `ev_ker_s / ev_ker_e` — `enqueueV3` |
+| D2H transfer | `ev_d2h_s / ev_d2h_e` — async copy of all output tensors |
+
+One `cudaStreamSynchronize` per iteration. Output now includes both a kernel-only table and a per-stage breakdown (H2D / Kernel / D2H / Total with mean/p50/p99).
+
+#### GPU profiling (`feature/nvtx-nsys`)
+
+NVTX range markers are added to the Python inference pipeline and the C++ TRT binary (gated behind `-DENABLE_NVTX` at build time):
+
+```bash
+sh script/profile_nsys.sh   # runs nsys profile + generates .nsys-rep
+nsys-ui output.nsys-rep      # visualise timeline
+```
 
 ---
 
