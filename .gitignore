@@ -165,3 +165,10 @@ outputs/
 inference/*.onnx
 inference/*.trt
 checkpoints/
+
+# TensorRT INT8 calibration artefacts
+# calib_data/ holds batch_*.npy files (~2 MB each, up to ~1 GB total).
+# *.trt.cache holds the TRT calibration scale-factor cache (~100 KB).
+# Both are generated locally and must never be committed.
+inference/calib_data/
+*.trt.cache

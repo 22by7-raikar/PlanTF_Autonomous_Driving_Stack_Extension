@@ -50,11 +50,16 @@ INT_FILL = 0
 BOOL_FILL = False
 
 # Tolerances (metres, since the trajectory output is in metres)
-TOL_ORT_CPP = 1e-4    # C++ ORT  vs Python ORT
+TOL_ORT_CPP  = 1e-4    # C++ ORT  vs Python ORT
 TOL_TRT_FP32 = 2e-3   # C++ TRT FP32 vs Python ORT  (<2 mm)
 TOL_TRT_FP16 = 0.25   # C++ TRT FP16 vs Python ORT  (<250 mm; FP16 precision loss expected)
                        # Note: deviation depends on inputs; constant-fill 0.1 can produce
                        # ~200mm deviation for first waypoints. See CPP_RUNTIME_REPORT.md.
+TOL_TRT_INT8 = 1.0    # C++ TRT INT8 vs Python ORT  (<1000 mm).
+                       # INT8 quantization error depends heavily on calibration quality.
+                       # Synthetic calibration (dump_calibration_data.py) may produce
+                       # larger deviations than real nuPlan data.  This loose tolerance
+                       # simply confirms the engine produces finite, non-NaN outputs.
 
 # Reference values collected from validated runs (constant-fill inputs)
 REFERENCE_ORT_PYTHON  = [-0.239406, 0.085293, 0.005405, -0.233568, 0.081084, 0.005540]
@@ -218,6 +223,8 @@ def main():
                         help="Path to FP32 TRT engine (.trt)")
     parser.add_argument("--fp16-engine", default=str(repo_root / "inference/planTF.trt"),
                         help="Path to FP16 TRT engine (.trt)")
+    parser.add_argument("--int8-engine", default=str(repo_root / "inference/planTF_int8.trt"),
+                        help="Path to INT8 TRT engine (.trt); skipped silently if absent")
     parser.add_argument("--cpp-build", default=str(repo_root / "cpp/build"),
                         help="Path to cmake build directory containing ort_infer / trt_infer")
     parser.add_argument("--no-python-ort", action="store_true",
@@ -230,6 +237,7 @@ def main():
     print(f"  ONNX model    : {args.onnx}")
     print(f"  FP32 engine   : {args.fp32_engine}")
     print(f"  FP16 engine   : {args.fp16_engine}")
+    print(f"  INT8 engine   : {args.int8_engine}")
     print(f"  C++ build dir : {args.cpp_build}")
     print()
 
@@ -278,6 +286,22 @@ def main():
     cpp_trt_fp16_vals = run_cpp_trt(args.cpp_build, args.fp16_engine, fp16=True)
     ok = compare("C++ TRT FP16 vs Python ORT", ref6, cpp_trt_fp16_vals, TOL_TRT_FP16)
     all_pass = all_pass and ok
+    print()
+
+    # Step 5 — C++ TRT INT8  (skipped when the engine file is absent)
+    # The INT8 engine is built by:
+    #   python inference/deploy/benchmark_tensorrt.py --int8 --rebuild
+    # The C++ trt_infer binary loads any .trt engine regardless of precision;
+    # precision is baked into the engine file itself.
+    print("── C++ TRT INT8 ────────────────────────────────────────────────────")
+    if not Path(args.int8_engine).exists():
+        print(f"  [SKIP] INT8 engine not found: {args.int8_engine}")
+        print(f"  Build with: python inference/deploy/benchmark_tensorrt.py "
+              f"--int8 --rebuild")
+    else:
+        cpp_trt_int8_vals = run_cpp_trt(args.cpp_build, args.int8_engine, fp16=False)
+        ok = compare("C++ TRT INT8 vs Python ORT", ref6, cpp_trt_int8_vals, TOL_TRT_INT8)
+        all_pass = all_pass and ok
     print()
 
     # Summary
