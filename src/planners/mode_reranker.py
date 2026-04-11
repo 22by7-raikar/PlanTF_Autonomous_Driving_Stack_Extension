@@ -107,15 +107,23 @@ def rerank_modes(
 
     route_centers = polygon_center[on_route_mask, :2]  # [R, 2]
 
-    # ── per-mode coverage scores ───────────────────────────────────────────
-    K = traj.shape[0]
-    coverage = torch.zeros(K, dtype=torch.float32, device=traj.device)
-
-    for k in range(K):
-        waypoints = traj[k, :, :2]                              # [T, 2]
-        dists = torch.cdist(waypoints, route_centers)           # [T, R]
-        min_dists = dists.min(dim=-1).values                    # [T]
-        coverage[k] = (min_dists <= ROUTE_DIST_THRESHOLD).float().mean()
+    # ── per-mode coverage scores (vectorised) ─────────────────────────────
+    # The original code ran a Python for-loop over K modes, issuing one
+    # torch.cdist call per iteration.  Each call dispatches a CUDA kernel
+    # independently, so the loop carries K−1 extra Python→GPU roundtrips.
+    #
+    # By reshaping all K*T waypoints into a single [K*T, 2] matrix we reduce
+    # that to a single kernel dispatch regardless of K.  The maths is
+    # identical:
+    #
+    #   Old: for k → cdist([T,2],[R,2]) → [T,R] → min → mean  (K calls)
+    #   New: cdist([K*T,2],[R,2]) → [K*T,R] → reshape[K,T,R] → min → mean
+    #
+    K, T_steps = traj.shape[0], traj.shape[1]
+    waypoints_flat = traj[:, :, :2].reshape(K * T_steps, 2)        # [K*T, 2]
+    dists_flat     = torch.cdist(waypoints_flat, route_centers)     # [K*T, R]
+    min_dists      = dists_flat.min(dim=-1).values.reshape(K, T_steps)  # [K, T]
+    coverage       = (min_dists <= ROUTE_DIST_THRESHOLD).float().mean(dim=-1)  # [K]
 
     # ── blended score and mode selection ──────────────────────────────────
     prob_norm = torch.softmax(prob, dim=-1)                     # [K]

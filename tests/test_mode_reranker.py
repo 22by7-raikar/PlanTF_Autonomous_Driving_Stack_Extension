@@ -326,3 +326,95 @@ class TestNumericalStability:
         data = _make_data()
         result = rerank_modes(out, data)
         assert result.shape == (T, 3)
+
+
+# ── test: vectorised implementation matches scalar loop ───────────────────────
+
+class TestVectorizedMatchesLooped:
+    """Verify that the vectorised coverage calculation is numerically identical
+    to the scalar loop it replaced.
+
+    The loop version is re-implemented here as a reference so this test
+    remains valid even after the production code no longer contains the loop.
+    Both implementations must produce identical float32 tensors (within the
+    epsilon of IEEE-754 floating-point; they perform the same operations in
+    the same order, so the outputs are bit-for-bit identical in practice).
+    """
+
+    @staticmethod
+    def _coverage_looped(traj: torch.Tensor, route_centers: torch.Tensor) -> torch.Tensor:
+        """Reference: scalar for-loop over modes (pre-vectorisation code)."""
+        K_ = traj.shape[0]
+        coverage = torch.zeros(K_, dtype=torch.float32, device=traj.device)
+        for k in range(K_):
+            waypoints = traj[k, :, :2]
+            dists = torch.cdist(waypoints, route_centers)
+            min_dists = dists.min(dim=-1).values
+            coverage[k] = (min_dists <= ROUTE_DIST_THRESHOLD).float().mean()
+        return coverage
+
+    @staticmethod
+    def _coverage_vectorized(traj: torch.Tensor, route_centers: torch.Tensor) -> torch.Tensor:
+        """Current implementation: single batched cdist call."""
+        K_, T_ = traj.shape[0], traj.shape[1]
+        waypoints_flat = traj[:, :, :2].reshape(K_ * T_, 2)
+        dists_flat = torch.cdist(waypoints_flat, route_centers)
+        min_dists = dists_flat.min(dim=-1).values.reshape(K_, T_)
+        return (min_dists <= ROUTE_DIST_THRESHOLD).float().mean(dim=-1)
+
+    def test_random_trajectories_coverage_matches(self):
+        """Random K×T trajectories and R centres → both implementations agree."""
+        torch.manual_seed(1337)
+        traj    = torch.randn(K, T, 4)
+        centers = torch.randn(10, 2)
+
+        cov_loop = self._coverage_looped(traj, centers)
+        cov_vec  = self._coverage_vectorized(traj, centers)
+        torch.testing.assert_close(cov_vec, cov_loop)
+
+    def test_single_on_route_polygon_coverage_matches(self):
+        """Edge case R=1: the two implementations must still agree."""
+        torch.manual_seed(42)
+        traj    = torch.randn(K, T, 4)
+        centers = torch.zeros(1, 2)   # single centre at the origin
+
+        cov_loop = self._coverage_looped(traj, centers)
+        cov_vec  = self._coverage_vectorized(traj, centers)
+        torch.testing.assert_close(cov_vec, cov_loop)
+
+    def test_rerank_output_matches_loop_reference(self):
+        """End-to-end: rerank_modes() with vectorised path selects the same
+        mode that the old loop-based implementation would have selected."""
+        torch.manual_seed(2024)
+        R_test = 15
+
+        traj = torch.randn(1, K, T, 4)
+        traj[..., 2:4] = torch.nn.functional.normalize(traj[..., 2:4], dim=-1)
+        prob = torch.randn(1, K)
+
+        # Build a data dict with R_test on-route polygon centres.
+        polygon_center = torch.zeros(1, M, 3)
+        polygon_center[0, :R_test, :2] = torch.randn(R_test, 2)
+        on_route = torch.zeros(1, M, dtype=torch.bool)
+        on_route[0, :R_test] = True
+
+        out  = _make_out(trajectory=traj, probability=prob)
+        data = _make_data(polygon_center=polygon_center, polygon_on_route=on_route)
+
+        # What rerank_modes() (vectorised) returns.
+        result_vec = rerank_modes(out, data, lambda_=DEFAULT_LAMBDA)
+
+        # What the scalar loop would return.
+        route_centers = polygon_center[0, :R_test, :2]   # [R_test, 2]
+        cov_loop  = self._coverage_looped(traj[0], route_centers)
+        prob_norm = torch.softmax(prob[0], dim=-1)
+        score     = (1.0 - DEFAULT_LAMBDA) * prob_norm + DEFAULT_LAMBDA * cov_loop
+        best_k    = score.argmax().item()
+        expected_xy = traj[0, best_k, :, :2].numpy()
+
+        np.testing.assert_allclose(
+            result_vec[:, :2],
+            expected_xy,
+            atol=1e-4,
+            err_msg=f"Vectorised path picked a different mode than the loop reference",
+        )
