@@ -152,11 +152,17 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --quiet \
-            torch==1.12.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install --quiet "numpy<1.24" "setuptools<70" wheel pytest \
+          # timm depends on torchvision; without a constraint pip pulls the newest
+          # torchvision, which upgrades torch and breaks the NATTEN 0.14 build.
+          printf "torch==1.12.1\ntorchvision==0.13.1\n" > /tmp/constraints.txt
+          pip install --quiet torch==1.12.1 torchvision==0.13.1 \
+            --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet -c /tmp/constraints.txt \
+            "numpy<1.24" "setuptools<70" wheel pytest \
             timm==0.6.13 numba shapely onnx==1.14.1 onnxruntime==1.16.3 "protobuf<4"
-          MAX_JOBS=4 pip install --quiet --no-build-isolation natten==0.14.6
+          MAX_JOBS=2 pip install --quiet -c /tmp/constraints.txt \
+            --no-build-isolation natten==0.14.6
+          python -c "import torch, natten; print('torch', torch.__version__, 'natten', natten.__version__)"
 
       - name: Run parity tests
         run: pytest tests/test_onnx_patches.py -v --tb=short
