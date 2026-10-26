@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: ["main", "dev"]
   pull_request:
     branches: ["main"]
 
@@ -30,23 +29,22 @@ jobs:
           [ $failed -eq 0 ] && echo "All .py files OK" || exit 1
 
       # ── YAML syntax ───────────────────────────────────────────────────────
-      - name: YAML syntax check (config/)
+      - name: YAML syntax check (config/ and workflows)
         run: |
           pip install pyyaml --quiet
-          echo "Checking YAML syntax in config/..."
-          failed=0
-          while IFS= read -r -d '' f; do
-            python -c "
-import yaml, sys
-try:
-    yaml.safe_load(open('$f'))
-except yaml.YAMLError as e:
-    print('FAIL: $f')
-    print(e)
-    sys.exit(1)
-" || failed=1
-          done < <(find config -name "*.yaml" -o -name "*.yml" | tr '\n' '\0')
-          [ $failed -eq 0 ] && echo "All config YAML files OK" || exit 1
+          python - <<'PYEOF'
+          import pathlib, sys, yaml
+          failed = False
+          files = sorted(pathlib.Path("config").rglob("*.y*ml")) + sorted(pathlib.Path(".github").rglob("*.y*ml"))
+          for f in files:
+              try:
+                  yaml.safe_load(f.read_text())
+              except yaml.YAMLError as e:
+                  print(f"FAIL: {f}\n{e}")
+                  failed = True
+          print("YAML FAILURES" if failed else f"All {len(files)} YAML files OK")
+          sys.exit(1 if failed else 0)
+          PYEOF
 
       # ── Bash syntax ───────────────────────────────────────────────────────
       - name: Bash syntax check (script/)
@@ -83,8 +81,11 @@ except yaml.YAMLError as e:
                   tree = ast.parse(path.read_text())
               except SyntaxError:
                   continue  # already caught by py_compile
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
+              # Module-level helpers only: methods (forward, ...) and script
+              # entry points (main) are expected to repeat.
+              for node in tree.body:
+                  if (isinstance(node, ast.FunctionDef)
+                          and not node.name.startswith("_") and node.name != "main"):
                       defs[node.name].append(str(path))
 
           duplicates = {k: v for k, v in defs.items() if len(v) > 1}
@@ -128,7 +129,39 @@ except yaml.YAMLError as e:
       - name: Run unit tests
         run: pytest tests/ -v --tb=short
 
-  # ── Job 3: C++ build (ORT CPU, no CUDA, no TRT) ───────────────────────────
+  # ── Job 3: ONNX export parity against real NATTEN ──────────────────────────
+  # Builds NATTEN 0.14.6 from source for CPU against the repo's torch 1.12, then
+  # checks every export patch (and an ONNX Runtime round-trip) against the
+  # original model on padded inputs. nuplan-devkit is stubbed (tests/nuplan_stub.py).
+  onnx-parity:
+    name: ONNX export parity (NATTEN)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Cache pip (torch 1.12 CPU + NATTEN wheel)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-torch112-natten0146-v1
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet \
+            torch==1.12.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet "numpy<1.24" "setuptools<70" wheel pytest \
+            timm==0.6.13 numba shapely onnx==1.14.1 onnxruntime==1.16.3 "protobuf<4"
+          MAX_JOBS=4 pip install --quiet --no-build-isolation natten==0.14.6
+
+      - name: Run parity tests
+        run: pytest tests/test_onnx_patches.py -v --tb=short
+
+  # ── Job 4: C++ build (ORT CPU, no CUDA, no TRT) ───────────────────────────
   cpp-build:
     name: C++ build (ort_infer)
     runs-on: ubuntu-latest
