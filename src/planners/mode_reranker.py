@@ -14,9 +14,15 @@ by lateral path errors:
   * ego trajectory enters an opposing-traffic lane
   * ego trajectory clips the kerb / island at a complex intersection
 
-In all cases the model *does* produce at least one mode that avoids the
-failure — the wrong mode just has a slightly higher predicted probability.
-Re-ranking by route coverage corrects this without any retraining.
+The hypothesis is that in some of these cases the model produces at least
+one mode that avoids the failure, but a worse mode has a slightly higher
+predicted probability. Re-ranking by route coverage can correct that without
+retraining. It cannot help when no mode is correct: the four zero-score TL
+intersection scenarios studied in the README stay at 0.0 after re-ranking
+because none of the K=6 modes follows the right path.
+
+Enabled with ``planner.imitation_planner.use_mode_reranker=true``; the
+weight is ``planner.imitation_planner.reranker_lambda``.
 
 Algorithm
 ---------

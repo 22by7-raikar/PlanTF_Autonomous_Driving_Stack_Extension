@@ -25,9 +25,11 @@ from nuplan.planning.training.modeling.torch_module_wrapper import TorchModuleWr
 
 from src.feature_builders.common.utils import rotate_round_z_axis
 
-from .mode_reranker import rerank_modes
+from .mode_reranker import DEFAULT_LAMBDA, rerank_modes
 from .planner_utils import global_trajectory_to_states, load_checkpoint
+from .tl_safety import apply_tl_brake
 
+_MODEL_PATCHES = ("none", "natten_onnx", "natten_faithful")
 
 
 class ImitationPlanner(AbstractPlanner):
@@ -44,13 +46,31 @@ class ImitationPlanner(AbstractPlanner):
         replan_interval: int = 1,
         use_gpu: bool = True,
         record_latency: bool = False,
+        use_mode_reranker: bool = False,
+        reranker_lambda: float = DEFAULT_LAMBDA,
+        use_tl_brake: bool = False,
+        model_patch: str = "none",
     ) -> None:
         """
         Initializes the ML planner class.
         :param model: Model to use for inference.
         :param record_latency: If True, append per-step latency to
             benchmarks/mini_v1/latency.csv.  Default False (off in eval runs).
+        :param use_mode_reranker: If True, select the output mode with
+            mode_reranker.rerank_modes instead of probability argmax.
+        :param reranker_lambda: Coverage weight passed to rerank_modes.
+        :param use_tl_brake: If True, post-process the trajectory with
+            tl_safety.apply_tl_brake (experimental, off by default).
+        :param model_patch: Swap NATTEN for a replacement before simulation, so
+            the deployable model can be evaluated closed-loop. One of
+            "none", "natten_onnx" (global MHA, as exported to ONNX/TRT) or
+            "natten_faithful" (local-window MHA).
         """
+        if model_patch not in _MODEL_PATCHES:
+            raise ValueError(
+                f"model_patch must be one of {_MODEL_PATCHES}, got {model_patch!r}"
+            )
+
         if use_gpu:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -91,6 +111,11 @@ class ImitationPlanner(AbstractPlanner):
                         "gpu_mem_mb",
                     ])
 
+        self._use_mode_reranker = use_mode_reranker
+        self._reranker_lambda = reranker_lambda
+        self._use_tl_brake = use_tl_brake
+        self._model_patch = model_patch
+
         self._step_idx = 0
 
     def initialize(self, initialization: PlannerInitialization) -> None:
@@ -99,6 +124,19 @@ class ImitationPlanner(AbstractPlanner):
 
         if self._planner_ckpt is not None:
             self._planner.load_state_dict(load_checkpoint(self._planner_ckpt))
+
+        # Patch after loading weights: the patches copy the trained NATTEN
+        # projections into the replacement attention modules.
+        if self._model_patch != "none":
+            from inference.common.patches import (
+                patch_natten_faithful,
+                patch_natten_for_onnx,
+            )
+
+            if self._model_patch == "natten_onnx":
+                patch_natten_for_onnx(self._planner)
+            else:
+                patch_natten_faithful(self._planner)
 
         self._planner.eval()
         self._planner = self._planner.to(self.device)
@@ -140,7 +178,21 @@ class ImitationPlanner(AbstractPlanner):
         forward_end = time.perf_counter()
         forward_ms = (forward_end - forward_start) * 1000.0
 
-        local_trajectory = rerank_modes(out, planner_feature_torch.data)
+        if self._use_mode_reranker:
+            local_trajectory = rerank_modes(
+                out, planner_feature_torch.data, lambda_=self._reranker_lambda
+            )
+        else:
+            local_trajectory = out["output_trajectory"][0].cpu().numpy()
+
+        if self._use_tl_brake:
+            ego_state = current_input.history.ego_states[-1]
+            local_trajectory = apply_tl_brake(
+                local_trajectory.astype(np.float64),
+                planner_feature_torch.data,
+                current_speed=ego_state.dynamic_car_state.rear_axle_velocity_2d.x,
+                dt=self._step_interval,
+            )
 
         planner_end = time.perf_counter()
         total_planner_ms = (planner_end - planner_start) * 1000.0
@@ -168,7 +220,11 @@ class ImitationPlanner(AbstractPlanner):
     def compute_planner_trajectory(
         self, current_input: PlannerInput
     ) -> AbstractTrajectory:
-        ego_state = current_input.history.ego_states[-1]    
+        """
+        Infer relative trajectory poses from model and convert to absolute agent states wrapped in a trajectory.
+        Inherited, see superclass.
+        """
+        ego_state = current_input.history.ego_states[-1]
 
         if self._last_plan_elapsed_step >= self._replan_interval:
             local_trajectory = self._planning(current_input)
@@ -189,6 +245,7 @@ class ImitationPlanner(AbstractPlanner):
         )
 
         self._inference_runtimes.append(time.perf_counter() - self._start_time)
+
         self._last_plan_elapsed_step += 1
 
         return trajectory
