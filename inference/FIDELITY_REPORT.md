@@ -7,6 +7,31 @@
 
 ---
 
+## Update (October 2026): both sources of divergence fixed
+
+The March results below were measured with the legacy export and **all-valid**
+dummy inputs. Two changes since then:
+
+1. **NATTEN is now exported exactly.** `patch_natten_exact` (`_ExactNA1D`)
+   re-implements NATTEN-1D with gather ops, keeping the RPB and NATTEN's edge
+   windows, so option C below ("register a custom op") is not needed. It matches
+   the real NATTEN 0.14.6 kernel to < 2e-7 and is the default for
+   `export_onnx.py` (`--natten global` keeps the legacy approximation).
+2. **`key_padding_mask` was not harmless.** The conclusion in section 4 that
+   dropping it "has zero effect" holds only for all-valid inputs. With padded
+   inputs (20/33 agents, 100/152 polygons valid, random weights) the legacy
+   export drifts ~0.45 m from the original, more than the NATTEN approximation
+   (~0.08 m). `_Bf1MHAWrapper` now applies the mask additively.
+
+With both fixes, the exported ONNX model matches original PyTorch + NATTEN to
+~1e-6 m on padded inputs (random weights; `tests/test_onnx_patches.py`, CI job
+`onnx-parity`). `compare_outputs.py` and `ablate_patches.py` now use padded
+inputs by default. **Still to do:** re-run both with the released checkpoint,
+rebuild the TensorRT engines from the new ONNX file, and re-measure latency;
+the latency and C++ numbers in this repo are for the legacy graph.
+
+---
+
 ## 1. Summary of Results
 
 | Comparison | Max abs error | Mean abs error | Mean pos error | Mean hdg error |

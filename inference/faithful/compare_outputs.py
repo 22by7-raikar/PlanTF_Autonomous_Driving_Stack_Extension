@@ -24,6 +24,11 @@ Usage:
     python inference/compare_outputs.py --onnx path/to.onnx # use existing ONNX
     python inference/compare_outputs.py --save              # save .npy outputs
     python inference/compare_outputs.py --agents 16 --polygons 64
+    python inference/compare_outputs.py --natten global      # legacy export
+    python inference/compare_outputs.py --valid-agents 33 --valid-polygons 152  # no padding
+
+Inputs are padded by default (--valid-agents / --valid-polygons) because
+real scenes are; with all-valid inputs, key-padding-mask bugs are invisible.
 """
 
 import argparse
@@ -41,13 +46,7 @@ import numpy as np
 import torch
 
 from run_inference import load_model, make_dummy_input, _build_onnx_feeds  # noqa: E402
-from patches import (
-    patch_natten_for_onnx,
-    patch_mha_for_onnx,
-    patch_boolean_indexing_for_onnx,
-    patch_agent_encoder_for_onnx,
-    patch_planning_model_for_onnx,
-)
+from patches import apply_onnx_export_patches  # noqa: E402
 from export_onnx import try_export
 
 
@@ -55,20 +54,17 @@ from export_onnx import try_export
 # Patch application
 # ---------------------------------------------------------------------------
 
-def _apply_patches(model: torch.nn.Module) -> None:
+def _apply_patches(model: torch.nn.Module, natten: str = "exact") -> None:
     """Apply all ONNX-compatibility patches in-place (mirrors export_onnx.py)."""
-    patch_natten_for_onnx(model)
-    patch_mha_for_onnx(model)
-    patch_boolean_indexing_for_onnx(model)
-    patch_agent_encoder_for_onnx(model)
-    patch_planning_model_for_onnx(model)
+    apply_onnx_export_patches(model, natten=natten)
 
 
-def _export_onnx(ckpt_path: str, out_path: str, agents: int, polygons: int) -> None:
+def _export_onnx(ckpt_path: str, out_path: str, agents: int, polygons: int,
+                 natten: str = "exact") -> None:
     """Re-export ONNX using the same patches as export_onnx.py."""
     device = torch.device("cpu")
     model = load_model(ckpt_path, device)
-    _apply_patches(model)
+    _apply_patches(model, natten=natten)
     data = make_dummy_input(A=agents, M=polygons, device=device)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     try_export(model, data, out_path, opset=14)
@@ -126,6 +122,12 @@ def main():
                         help="Re-export ONNX before comparison (keeps it in sync with patches)")
     parser.add_argument("--agents",   type=int, default=33)
     parser.add_argument("--polygons", type=int, default=152)
+    parser.add_argument("--natten",   choices=["exact", "global"], default="exact",
+                        help="NATTEN replacement: exact (default) or legacy global MHA")
+    parser.add_argument("--valid-agents",   type=int, default=20,
+                        help="Agents marked valid (rest padded); padding exercises key_padding_mask")
+    parser.add_argument("--valid-polygons", type=int, default=100,
+                        help="Polygons marked valid (rest padded)")
     parser.add_argument("--save",     action="store_true",
                         help="Save outputs to outputs/{original,patched,onnx}.npy")
     args = parser.parse_args()
@@ -144,7 +146,7 @@ def main():
     # ------------------------------------------------------------------
     print("Loading patched model ...")
     model_patched = load_model(args.ckpt, device)
-    _apply_patches(model_patched)
+    _apply_patches(model_patched, natten=args.natten)
 
     # ------------------------------------------------------------------
     # 3. Export / load ONNX
@@ -155,7 +157,7 @@ def main():
             print(f"ONNX file not found at {args.onnx} — exporting ...")
         else:
             print(f"Re-exporting ONNX to {args.onnx} ...")
-        _export_onnx(args.ckpt, args.onnx, args.agents, args.polygons)
+        _export_onnx(args.ckpt, args.onnx, args.agents, args.polygons, natten=args.natten)
 
     print(f"Loading ONNX model from {args.onnx} ...")
     try:
@@ -171,8 +173,11 @@ def main():
     # 4. Shared input (same seed → same tensors for all three models)
     # ------------------------------------------------------------------
     torch.manual_seed(0)
-    data = make_dummy_input(A=args.agents, M=args.polygons, device=device)
-    print(f"\nInput: A={args.agents} agents, M={args.polygons} polygons")
+    data = make_dummy_input(A=args.agents, M=args.polygons, device=device,
+                            valid_agents=args.valid_agents,
+                            valid_polygons=args.valid_polygons)
+    print(f"\nInput: A={args.agents} agents ({args.valid_agents} valid), "
+          f"M={args.polygons} polygons ({args.valid_polygons} valid)")
 
     # ------------------------------------------------------------------
     # 5. Run inference

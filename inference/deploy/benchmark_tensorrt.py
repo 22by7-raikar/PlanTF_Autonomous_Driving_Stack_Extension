@@ -57,13 +57,7 @@ import numpy as np
 import torch
 
 from run_inference import load_model, make_dummy_input, _metrics
-from patches import (
-    patch_natten_for_onnx,
-    patch_mha_for_onnx,
-    patch_boolean_indexing_for_onnx,
-    patch_agent_encoder_for_onnx,
-    patch_planning_model_for_onnx,
-)
+from patches import apply_onnx_export_patches
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +546,8 @@ def main() -> None:
                         help="Path to TRT engine cache (built if absent)")
     parser.add_argument("--agents",      type=int,  default=33)
     parser.add_argument("--polygons",    type=int,  default=152)
+    parser.add_argument("--natten",   choices=["exact", "global"], default="exact",
+                        help="NATTEN replacement: exact (default) or legacy global MHA")
     parser.add_argument("--warmup",      type=int,  default=10)
     parser.add_argument("--runs",        type=int,  default=100)
     parser.add_argument("--fp32",        action="store_true",
@@ -628,11 +624,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("── 1. Patched PyTorch (CPU) ──────────────────────────────────")
     model_p = load_model(args.ckpt, torch.device("cpu"))
-    patch_natten_for_onnx(model_p)
-    patch_mha_for_onnx(model_p)
-    patch_boolean_indexing_for_onnx(model_p)
-    patch_agent_encoder_for_onnx(model_p)
-    patch_planning_model_for_onnx(model_p)
+    apply_onnx_export_patches(model_p, natten=args.natten)
     with torch.no_grad():
         outputs["Patched PyTorch CPU"] = model_p(cpu_data)["output_trajectory"].cpu().numpy()
     print(f"  Timing ({args.warmup} warmup, {args.runs} runs) ...", end=" ", flush=True)
@@ -648,11 +640,7 @@ def main() -> None:
         print("── 2. Patched PyTorch (CUDA) ─────────────────────────────────")
         cuda_device = torch.device("cuda")
         model_pc = load_model(args.ckpt, cuda_device)
-        patch_natten_for_onnx(model_pc)
-        patch_mha_for_onnx(model_pc)
-        patch_boolean_indexing_for_onnx(model_pc)
-        patch_agent_encoder_for_onnx(model_pc)
-        patch_planning_model_for_onnx(model_pc)
+        apply_onnx_export_patches(model_pc, natten=args.natten)
         model_pc = model_pc.to(cuda_device)  # move patch wrappers to CUDA
         cuda_data = _to_device(cpu_data, cuda_device)
         with torch.no_grad():

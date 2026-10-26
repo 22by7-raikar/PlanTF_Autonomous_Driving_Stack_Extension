@@ -43,6 +43,8 @@ from patches import (
     patch_boolean_indexing_for_onnx,
     patch_agent_encoder_for_onnx,
     patch_planning_model_for_onnx,
+    patch_natten_exact,
+    apply_onnx_export_patches,
 )
 
 
@@ -75,6 +77,10 @@ def main():
     parser.add_argument("--ckpt",     default=_default_ckpt)
     parser.add_argument("--agents",   type=int, default=33)
     parser.add_argument("--polygons", type=int, default=152)
+    parser.add_argument("--valid-agents",   type=int, default=20,
+                        help="Agents marked valid (rest padded); padding exercises key_padding_mask")
+    parser.add_argument("--valid-polygons", type=int, default=100,
+                        help="Polygons marked valid (rest padded)")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -82,7 +88,9 @@ def main():
 
     # Shared input — same for every variant
     torch.manual_seed(0)
-    data = make_dummy_input(A=args.agents, M=args.polygons, device=device)
+    data = make_dummy_input(A=args.agents, M=args.polygons, device=device,
+                            valid_agents=args.valid_agents,
+                            valid_polygons=args.valid_polygons)
 
     # ------------------------------------------------------------------
     # Baseline: original unmodified model
@@ -103,13 +111,9 @@ def main():
         ("only patch_mha",                         patch_mha_for_onnx),
         ("only patch_natten (global MHA)",         patch_natten_for_onnx),
         ("only patch_natten_faithful (local MHA)", patch_natten_faithful),
-        ("all patches (ONNX export config)",       lambda m: (
-            patch_natten_for_onnx(m),
-            patch_mha_for_onnx(m),
-            patch_boolean_indexing_for_onnx(m),
-            patch_agent_encoder_for_onnx(m),
-            patch_planning_model_for_onnx(m),
-        )),
+        ("only patch_natten_exact",                patch_natten_exact),
+        ("all patches, legacy global NATTEN",      lambda m: apply_onnx_export_patches(m, natten="global")),
+        ("all patches (ONNX export config)",       lambda m: apply_onnx_export_patches(m, natten="exact")),
     ]
 
     # ------------------------------------------------------------------

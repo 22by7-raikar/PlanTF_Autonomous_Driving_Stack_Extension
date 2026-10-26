@@ -3,11 +3,12 @@ export_onnx.py
 --------------
 Exports planTF to ONNX with fixed input shapes.
 
-NOTE: The model uses NATTEN (Neighborhood Attention) which is not ONNX-compatible.
-Before export, `patch_natten_for_onnx()` replaces every NeighborhoodAttention1D
-in each NATLayer with a standard nn.MultiheadAttention, copying qkv + proj weights.
-The RPB (relative positional bias) is discarded; the result is semantically a global
-attention approximation — suitable for benchmarking ONNX throughput.
+NOTE: The model uses NATTEN (Neighborhood Attention), which has no ONNX symbolic.
+Before export, `patch_natten_exact()` (default, `--natten exact`) replaces every
+NeighborhoodAttention1D with a gather-based re-implementation that keeps the
+relative positional bias and NATTEN's edge windows, so the exported graph matches
+the original model to float precision. `--natten global` selects the legacy
+global-MHA approximation (RPB dropped, ~0.35 m mean position error).
 
 To restore NATTEN for nuPlan runs, simply reload the original checkpoint with
 `load_model()` from run_inference.py (no in-place patching done there).
@@ -16,6 +17,7 @@ Usage (from repo root):
     python inference/deploy/export_onnx.py
     python inference/deploy/export_onnx.py --ckpt path/to/other.ckpt
     python inference/deploy/export_onnx.py --agents 33 --polygons 152 --opset 14
+    python inference/deploy/export_onnx.py --natten global   # legacy approximation
 """
 
 import argparse
@@ -39,7 +41,10 @@ from run_inference import load_model, make_dummy_input   # reuse helpers
 from patches import (  # noqa: F401
     _MHAWrapper,
     _LocalWindowMHA,
+    _ExactNA1D,
     _Bf1MHAWrapper,
+    apply_onnx_export_patches,
+    patch_natten_exact,
     patch_natten_for_onnx,
     patch_natten_faithful,
     patch_mha_for_onnx,
@@ -248,6 +253,8 @@ def main():
     parser.add_argument("--agents",   type=int, default=33)
     parser.add_argument("--polygons", type=int, default=152)
     parser.add_argument("--opset",    type=int, default=14)
+    parser.add_argument("--natten",   choices=["exact", "global"], default="exact",
+                        help="NATTEN replacement: exact (default) or legacy global MHA")
     parser.add_argument("--verify",   action="store_true", default=True,
                         help="Verify with onnxruntime after export")
     args = parser.parse_args()
@@ -258,16 +265,8 @@ def main():
     model = load_model(args.ckpt, device)
     print("Model loaded OK")
 
-    print("\nPatching NATTEN → nn.MultiheadAttention for ONNX export...")
-    patch_natten_for_onnx(model)
-    print("Patching batch_first MHA → ONNX-compatible wrappers...")
-    patch_mha_for_onnx(model)
-    print("Patching boolean indexing → mask-multiply / torch.where ...")
-    patch_boolean_indexing_for_onnx(model)
-    print("Patching AgentEncoder boolean indexing ...")
-    patch_agent_encoder_for_onnx(model)
-    print("Patching atan2 → ONNX-friendly substitute ...")
-    patch_planning_model_for_onnx(model)
+    print(f"\nApplying ONNX export patches (NATTEN replacement: {args.natten}) ...")
+    apply_onnx_export_patches(model, natten=args.natten)
 
     data = make_dummy_input(A=args.agents, M=args.polygons, device=device)
 

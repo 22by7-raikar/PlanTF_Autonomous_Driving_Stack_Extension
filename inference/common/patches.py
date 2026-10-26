@@ -9,16 +9,21 @@ accessible to the faithful track without creating a cross-track dependency.
 Public API
 ----------
 patch_natten_for_onnx          -- NATTEN → global nn.MultiheadAttention (ONNX-safe)
-patch_natten_faithful          -- NATTEN → local-window MHA (PyTorch-only, faithful)
+patch_natten_faithful          -- NATTEN → local-window MHA (PyTorch-only, approximate)
+patch_natten_exact             -- NATTEN → exact gather-based re-implementation
+                                  (ONNX-safe, keeps RPB and NATTEN's edge windows)
 patch_mha_for_onnx             -- batch_first=True MHA → batch_first=False wrapper
 patch_boolean_indexing_for_onnx -- bool-indexing → mask-multiply / torch.where
 patch_agent_encoder_for_onnx   -- AgentEncoder bool-gather → gate-multiply
 patch_planning_model_for_onnx  -- atan2 → ONNX-exportable approximation
+apply_onnx_export_patches      -- every patch above, as applied before export
 
 Internal wrapper classes (also importable if needed):
 _MHAWrapper        -- drop-in for NeighborhoodAttention1D (global MHA)
 _LocalWindowMHA    -- drop-in for NeighborhoodAttention1D (local-window MHA)
-_Bf1MHAWrapper     -- batch_first=False wrapper for existing MHA modules
+_ExactNA1D         -- drop-in for NeighborhoodAttention1D (exact, ONNX-safe)
+_Bf1MHAWrapper     -- ONNX-safe re-implementation of existing MHA modules
+                      (key_padding_mask kept as an additive float mask)
 """
 
 import os
@@ -29,6 +34,8 @@ _inference = os.path.dirname(_here)
 _repo_root  = os.path.dirname(_inference)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
+
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -89,6 +96,10 @@ class _LocalWindowMHA(nn.Module):
 
     This is NOT ONNX-exportable with PyTorch 1.12 due to `unfold`, but it
     provides much higher PyTorch fidelity than plain global MHA for levels 0/1.
+
+    Two differences from NATTEN remain: the RPB is dropped, and edge tokens
+    attend to zero-padded keys/values, whereas NATTEN shifts the window inward
+    so every token sees kernel_size real neighbours. _ExactNA1D fixes both.
     """
 
     def __init__(
@@ -154,44 +165,137 @@ class _LocalWindowMHA(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# _ExactNA1D — exact NATTEN-1D re-implementation (ONNX-safe)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def _na1d_indices(length: int, kernel_size: int):
+    """Neighbour and relative-position-bias indices used by NATTEN 1D.
+
+    Mirrors NATTEN's get_window_start / get_pb_start for dilation 1: a token
+    near either edge keeps a full window of kernel_size real neighbours by
+    shifting the window inward, and the RPB index shifts with it.
+
+    Returns two LongTensors of shape [length, kernel_size].
+    """
+    nb = kernel_size // 2
+    win, pb = [], []
+    for i in range(length):
+        start = max(i - nb, 0) + (i + nb >= length) * (length - i - nb - 1)
+        pb_start = nb + (i < nb) * (nb - i) + (i + nb >= length) * (length - i - 1 - nb)
+        win.append([start + j for j in range(kernel_size)])
+        pb.append([pb_start + j for j in range(kernel_size)])
+    return torch.tensor(win, dtype=torch.long), torch.tensor(pb, dtype=torch.long)
+
+
+class _ExactNA1D(nn.Module):
+    """
+    Drop-in for NeighborhoodAttention1D (dilation 1) that reproduces its output
+    to float precision, using only gather / multiply / softmax.
+
+    Unlike _MHAWrapper and _LocalWindowMHA it keeps the relative positional
+    bias and NATTEN's edge handling, so no accuracy is traded for
+    exportability. The neighbour indices depend only on the sequence length,
+    which is fixed for a given input shape, so they are baked into the ONNX
+    graph as constants.
+    """
+
+    def __init__(self, nat_attn: nn.Module):
+        super().__init__()
+        if getattr(nat_attn, "dilation", 1) != 1:
+            raise NotImplementedError("_ExactNA1D only supports dilation=1")
+        self.num_heads = nat_attn.num_heads
+        self.kernel_size = nat_attn.kernel_size
+        self.scale = nat_attn.scale
+        # Reuse the trained parameters directly (no copy needed).
+        self.qkv = nat_attn.qkv
+        self.proj = nat_attn.proj
+        self.rpb = nat_attn.rpb
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, Lp, C = x.shape
+        H = self.num_heads
+        D = C // H
+        ks = self.kernel_size
+
+        # NATTEN zero-pads inputs shorter than the window (before qkv).
+        pad_r = max(0, ks - Lp)
+        if pad_r:
+            x = F.pad(x, (0, 0, 0, pad_r))
+        L = x.shape[1]
+
+        qkv = self.qkv(x).reshape(B, L, 3, H, D).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]   # each [B, H, L, D]
+
+        win, pb = _na1d_indices(L, ks)
+        win = win.to(x.device)
+        k_win = k.index_select(2, win.flatten()).view(B, H, L, ks, D)
+        v_win = v.index_select(2, win.flatten()).view(B, H, L, ks, D)
+
+        attn = (q.unsqueeze(3) * k_win).sum(-1)          # [B, H, L, ks]
+        if self.rpb is not None:
+            attn = attn + self.rpb[:, pb.to(x.device)]   # [H, L, ks]
+        attn = attn.softmax(dim=-1)
+
+        out = (attn.unsqueeze(-1) * v_win).sum(3)        # [B, H, L, D]
+        out = out.permute(0, 2, 1, 3).reshape(B, L, C)
+        if pad_r:
+            out = out[:, :Lp]
+        return self.proj(out)
+
+
+# ---------------------------------------------------------------------------
 # _Bf1MHAWrapper — batch_first=False wrapper for existing MHA modules
 # ---------------------------------------------------------------------------
 
 class _Bf1MHAWrapper(nn.Module):
     """
-    Wraps an existing nn.MultiheadAttention (batch_first=True) and forwards
-    calls using batch_first=False to avoid PyTorch 1.12's fused
-    _native_multi_head_attention kernel.
+    ONNX-safe replacement for an existing nn.MultiheadAttention
+    (batch_first=True, inference only).
 
-    key_padding_mask is dropped: the PyTorch 1.12 ONNX exporter cannot
-    serialize the bool-mask Expand op correctly.  For ONNX throughput
-    benchmarking with fixed shapes, no padding is needed.
+    Computes attention explicitly instead of calling nn.MultiheadAttention,
+    which avoids PyTorch 1.12's fused _native_multi_head_attention kernel and
+    the exporter's bool-mask Expand bug. key_padding_mask is applied as an
+    additive float mask, so padded agents / map polygons are still ignored.
+
+    (An earlier version dropped key_padding_mask entirely. That is invisible
+    with all-valid dummy inputs but changes outputs whenever a scene has
+    fewer than max agents or polygons, i.e. in practically every real scene.)
     """
+
+    _MASK_VALUE = -1e9
 
     def __init__(self, mha: nn.MultiheadAttention):
         super().__init__()
-        dim = mha.embed_dim
-        num_heads = mha.num_heads
-        self.mha = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            batch_first=False,
-        )
-        with torch.no_grad():
-            self.mha.in_proj_weight.copy_(mha.in_proj_weight)
-            self.mha.in_proj_bias.copy_(mha.in_proj_bias)
-            self.mha.out_proj.weight.copy_(mha.out_proj.weight)
-            self.mha.out_proj.bias.copy_(mha.out_proj.bias)
+        if mha.bias_k is not None or not mha._qkv_same_embed_dim:
+            raise NotImplementedError("_Bf1MHAWrapper needs packed qkv without bias_kv")
+        self.num_heads = mha.num_heads
+        self.head_dim = mha.embed_dim // mha.num_heads
+        self.in_proj_weight = mha.in_proj_weight
+        self.in_proj_bias = mha.in_proj_bias
+        self.out_proj = mha.out_proj
 
     def forward(self, query, key, value, key_padding_mask=None,
                 need_weights=True, attn_mask=None):
-        # drop key_padding_mask to avoid ONNX bool-Expand bug
-        q = query.transpose(0, 1)
-        k = key.transpose(0, 1)
-        v = value.transpose(0, 1)
-        out, w = self.mha(q, k, v, need_weights=need_weights)
-        out = out.transpose(0, 1)
-        return out, w
+        if attn_mask is not None:
+            raise NotImplementedError("attn_mask is not used by PlanTF")
+        B, Lq, C = query.shape
+        Lk = key.shape[1]
+        H, D = self.num_heads, self.head_dim
+
+        w_q, w_k, w_v = self.in_proj_weight.chunk(3, dim=0)
+        b_q, b_k, b_v = self.in_proj_bias.chunk(3, dim=0)
+        q = F.linear(query, w_q, b_q).view(B, Lq, H, D).transpose(1, 2)  # [B, H, Lq, D]
+        k = F.linear(key, w_k, b_k).view(B, Lk, H, D).transpose(1, 2)    # [B, H, Lk, D]
+        v = F.linear(value, w_v, b_v).view(B, Lk, H, D).transpose(1, 2)
+
+        attn = torch.matmul(q, k.transpose(-1, -2)) * (D ** -0.5)        # [B, H, Lq, Lk]
+        if key_padding_mask is not None:
+            attn = attn + key_padding_mask.view(B, 1, 1, Lk).float() * self._MASK_VALUE
+        attn = attn.softmax(dim=-1)
+
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, Lq, C)
+        return self.out_proj(out), None
 
 
 # ---------------------------------------------------------------------------
@@ -254,11 +358,29 @@ def patch_natten_faithful(model: nn.Module) -> None:
     )
 
 
+def patch_natten_exact(model: nn.Module) -> None:
+    """
+    Replace NeighborhoodAttention1D with _ExactNA1D — numerically equivalent
+    to NATTEN (RPB and edge windows preserved) and ONNX-exportable.
+    """
+    from src.models.planTF.layers.embedding import NATLayer
+
+    patched = 0
+    for module in model.modules():
+        if isinstance(module, NATLayer):
+            module.attn = _ExactNA1D(module.attn)
+            patched += 1
+    print(f"patch_natten_exact: replaced {patched} NATLayer blocks with exact NA1D")
+
+
 def patch_mha_for_onnx(model: nn.Module) -> None:
     """
     Replace batch_first=True nn.MultiheadAttention modules in
     TransformerEncoderLayer and StateAttentionEncoder with _Bf1MHAWrapper
-    (batch_first=False, key_padding_mask dropped).
+    (explicit attention; key_padding_mask kept for TransformerEncoderLayer).
+
+    StateAttentionEncoder only builds a key_padding_mask in training mode
+    (state dropout), so at inference it has none to pass.
     """
     import types
     from src.models.planTF.layers.transformer_encoder_layer import TransformerEncoderLayer
@@ -272,7 +394,11 @@ def patch_mha_for_onnx(model: nn.Module) -> None:
 
             def _fwd(self, src, mask=None, key_padding_mask=None):
                 src2 = self.norm1(src)
-                src2, _ = self.attn(src2, src2, src2, need_weights=False)
+                src2, _ = self.attn(
+                    src2, src2, src2,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
                 src = src + self.drop_path1(src2)
                 src = src + self.drop_path2(self.mlp(self.norm2(src)))
                 return src
@@ -297,7 +423,7 @@ def patch_mha_for_onnx(model: nn.Module) -> None:
             module.forward = types.MethodType(_sea_fwd, module)
             patched += 1
 
-    print(f"patch_mha_for_onnx: patched {patched} MHA modules (dropped key_padding_mask)")
+    print(f"patch_mha_for_onnx: patched {patched} MHA modules (key_padding_mask kept)")
 
 
 def patch_boolean_indexing_for_onnx(model: nn.Module) -> None:
@@ -522,3 +648,21 @@ def patch_planning_model_for_onnx(model: nn.Module) -> None:
             patched += 1
 
     print(f"patch_planning_model_for_onnx: patched {patched} PlanningModel modules")
+
+
+def apply_onnx_export_patches(model: nn.Module, natten: str = "exact") -> None:
+    """
+    Apply every patch used for ONNX export, in order.
+
+    natten="exact"  : _ExactNA1D (numerically equivalent to NATTEN; default)
+    natten="global" : _MHAWrapper (legacy global-attention approximation,
+                      ~0.35 m mean position error on the released checkpoint)
+    """
+    natten_patches = {"exact": patch_natten_exact, "global": patch_natten_for_onnx}
+    if natten not in natten_patches:
+        raise ValueError(f"natten must be one of {sorted(natten_patches)}, got {natten!r}")
+    natten_patches[natten](model)
+    patch_mha_for_onnx(model)
+    patch_boolean_indexing_for_onnx(model)
+    patch_agent_encoder_for_onnx(model)
+    patch_planning_model_for_onnx(model)

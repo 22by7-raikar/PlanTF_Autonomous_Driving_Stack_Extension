@@ -29,7 +29,7 @@ from .mode_reranker import DEFAULT_LAMBDA, rerank_modes
 from .planner_utils import global_trajectory_to_states, load_checkpoint
 from .tl_safety import apply_tl_brake
 
-_MODEL_PATCHES = ("none", "natten_onnx", "natten_faithful")
+_MODEL_PATCHES = ("none", "natten_exact", "natten_onnx", "natten_faithful", "onnx_export")
 
 
 class ImitationPlanner(AbstractPlanner):
@@ -61,10 +61,13 @@ class ImitationPlanner(AbstractPlanner):
         :param reranker_lambda: Coverage weight passed to rerank_modes.
         :param use_tl_brake: If True, post-process the trajectory with
             tl_safety.apply_tl_brake (experimental, off by default).
-        :param model_patch: Swap NATTEN for a replacement before simulation, so
-            the deployable model can be evaluated closed-loop. One of
-            "none", "natten_onnx" (global MHA, as exported to ONNX/TRT) or
-            "natten_faithful" (local-window MHA).
+        :param model_patch: Patch the model before simulation, so deployable
+            variants can be evaluated closed-loop. One of
+            "none", "natten_exact" (exact NATTEN re-implementation),
+            "natten_onnx" (legacy global-MHA approximation),
+            "natten_faithful" (local-window MHA) or
+            "onnx_export" (every patch applied before ONNX export, i.e. the
+            graph that is exported to ONNX/TensorRT).
         """
         if model_patch not in _MODEL_PATCHES:
             raise ValueError(
@@ -128,15 +131,14 @@ class ImitationPlanner(AbstractPlanner):
         # Patch after loading weights: the patches copy the trained NATTEN
         # projections into the replacement attention modules.
         if self._model_patch != "none":
-            from inference.common.patches import (
-                patch_natten_faithful,
-                patch_natten_for_onnx,
-            )
+            from inference.common import patches
 
-            if self._model_patch == "natten_onnx":
-                patch_natten_for_onnx(self._planner)
-            else:
-                patch_natten_faithful(self._planner)
+            {
+                "natten_exact": patches.patch_natten_exact,
+                "natten_onnx": patches.patch_natten_for_onnx,
+                "natten_faithful": patches.patch_natten_faithful,
+                "onnx_export": patches.apply_onnx_export_patches,
+            }[self._model_patch](self._planner)
 
         self._planner.eval()
         self._planner = self._planner.to(self.device)

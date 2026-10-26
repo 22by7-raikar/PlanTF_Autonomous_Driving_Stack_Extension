@@ -82,13 +82,22 @@ def load_model(ckpt_path: str, device: torch.device) -> PlanningModel:
     return model
 
 
-def make_dummy_input(A: int = 33, M: int = 152, device: torch.device = torch.device("cpu")) -> dict:
+def make_dummy_input(
+    A: int = 33,
+    M: int = 152,
+    device: torch.device = torch.device("cpu"),
+    valid_agents: int = None,
+    valid_polygons: int = None,
+) -> dict:
     """
     Build a dummy input dict matching the shapes produced by NuplanFeatureBuilder.
     A = number of agents (including ego at index 0), max 33 (max_agents=32 + ego)
     M = number of map polygons, varies per scene
     T = 21 history steps (history_horizon=2s at 10Hz + current = 21)
     P = 20 points per polygon side
+
+    valid_agents / valid_polygons: if given, only the first N agents / polygons
+    are marked valid and the rest are padding, as in real scenes. Default: all valid.
     """
     T = 21   # history_steps
     P = 20   # points per polygon side
@@ -122,6 +131,10 @@ def make_dummy_input(A: int = 33, M: int = 152, device: torch.device = torch.dev
         "origin":        torch.randn(1, 2,  device=device),
         "angle":         torch.randn(1,     device=device),
     }
+    if valid_agents is not None:
+        data["agent"]["valid_mask"][:, valid_agents:] = False
+    if valid_polygons is not None:
+        data["map"]["valid_mask"][:, valid_polygons:] = False
     return data
 
 

@@ -163,27 +163,46 @@ python inference/verify_refactor.py --verbose # show detail on every check
 | `atan2` substitute | **Yes** | Max heading error < 1e-6 rad |
 | `F.interpolate` size→ fix | **Yes** | Functionally identical |
 
+## Exact NATTEN Export (default)
+
+`patch_natten_exact` replaces `NeighborhoodAttention1D` with `_ExactNA1D`, a
+gather-based re-implementation of NATTEN's 1D kernel for dilation 1. It keeps
+the relative positional bias and NATTEN's edge handling: tokens near either
+end of the sequence keep a full window of `kernel_size` real neighbours
+because the window shifts inward. The neighbour and bias indices depend only
+on the sequence length (21 → 11 → 6 for the agent history encoder), so they
+are baked into the ONNX graph as constants. Only standard ops are used
+(Gather, Mul, ReduceSum, Softmax).
+
+`tests/test_onnx_patches.py` checks it against the real NATTEN 0.14.6 package
+and runs in CI (`onnx-parity` job). Measured on CPU with the released
+architecture, random weights (RPB scaled to std 1 so it matters) and padded
+inputs (20/33 agents, 100/152 polygons valid):
+
+| Comparison vs original PyTorch + NATTEN | Max position error |
+|---|---|
+| `_ExactNA1D` module vs `NeighborhoodAttention1D` (all PlanTF lengths) | < 2e-7 |
+| PyTorch, all export patches, `--natten exact` | ~1e-6 m |
+| ONNX Runtime, exported with `--natten exact` | ~1e-6 m |
+| PyTorch, all export patches, `--natten global` (legacy) | ~0.08 m |
+| Legacy export (global NATTEN + dropped `key_padding_mask`) | ~0.45 m |
+
+Exactness costs no latency: in the C++ ONNX Runtime benchmark (`cpp/ort_infer`,
+CPU, 4 vCPU container, 200 runs) the exact graph ran at p50 ≈ 38.5 ms vs
+≈ 40 ms for the legacy global-MHA graph, i.e. within noise.
+
+These are random-weight numbers. Re-run `faithful/compare_outputs.py` and
+`faithful/ablate_patches.py` with the released checkpoint to replace the
+March figures in FIDELITY_REPORT.md.
+
 ## What Is Approximate
 
 | Component | Approximation | Error introduced |
 |---|---|---|
-| NATTEN → global MHA (`patch_natten_for_onnx`) | **Major** | Windowed+RPB → global, no RPB. Max trajectory error ≈ **0.86** |
-| NATTEN → local-window MHA (`patch_natten_faithful`) | **Minor** | Windowed (no RPB). Closer to original; run `ablate_patches.py` to quantify |
-| Dropped `key_padding_mask` | **Minor** | Zero with all-valid inputs; increases with sparse scenes |
+| NATTEN → global MHA (`patch_natten_for_onnx`, `--natten global`) | **Major** | Windowed+RPB → global, no RPB. Max trajectory error ≈ **0.86** on the checkpoint |
+| NATTEN → local-window MHA (`patch_natten_faithful`) | **Minor** | Windowed, no RPB, zero-padded edge windows. Superseded by `patch_natten_exact` |
 
-## Current Blocker to Faithful ONNX Export
-
-**NATTEN (`NeighborhoodAttention1D`)** uses a CUDA/C++ custom op with no ONNX
-symbolic registered in PyTorch 1.12. Two paths to unblock:
-
-1. **Register a custom ONNX op** for NATTEN and a corresponding TensorRT plugin.
-   See [SHI-Labs/NATTEN](https://github.com/SHI-Labs/NATTEN) for the op interface.
-
-2. **Upgrade PyTorch** — newer PyTorch versions *may* include NATTEN ONNX support
-   if the NATTEN package is updated accordingly.
-
-The `_LocalWindowMHA` in `deploy/export_onnx.py` provides a faithful PyTorch approximation
-(same window size, weights copied, RPB omitted) for use in non-ONNX contexts.
+`key_padding_mask` is no longer dropped (see Patch 2).
 
 ---
 
@@ -209,11 +228,11 @@ files are **never modified**.
 
 | | |
 |---|---|
-| **What** | Re-wraps existing `nn.MultiheadAttention(batch_first=True)` modules in `TransformerEncoderLayer` and `StateAttentionEncoder` with `batch_first=False` wrappers |
+| **What** | Replaces `nn.MultiheadAttention(batch_first=True)` modules in `TransformerEncoderLayer` and `StateAttentionEncoder` with `_Bf1MHAWrapper`, which computes attention explicitly from the same weights |
 | **Scope** | 4 `TransformerEncoderLayer` blocks + 1 `StateAttentionEncoder` = 5 modules |
-| **Dropped** | `key_padding_mask` — PyTorch 1.12 ONNX exporter cannot serialize the `bool → Expand` op it generates |
-| **Classification** | **Approximate / behaviour-changing** |
-| **Risk** | Padding mask tells the model which agents / map polygons are valid. Dropping it means invalid (zero-padded) tokens participate in attention, which may dilute ego-relevant features. Effect is larger when the number of valid agents/polygons is much less than the max. With the dummy input (all valid), the difference is minimal. |
+| **Mask** | `key_padding_mask` is applied as an additive float mask (−1e9), which avoids the PyTorch 1.12 exporter's `bool → Expand` bug. `StateAttentionEncoder` only builds a mask in training, so it has none at inference |
+| **Classification** | **Safe** (matches original to float precision, padded inputs included) |
+| **History** | Earlier versions dropped `key_padding_mask`. That is invisible with the all-valid dummy input that the March ablation used, but lets padded agents/polygons into the encoder's attention in real scenes (~0.45 m max position error with padded inputs, random weights). `test_padding_values_do_not_leak` guards against this. |
 
 ### Patch 3 — `patch_boolean_indexing_for_onnx`
 
@@ -256,8 +275,9 @@ shape-inference pass cannot handle a dynamic scalar `scale_factor`. Safe for all
 
 | Patch | Classification | Expected output delta |
 |---|---|---|
-| NATTEN → global MHA | **Approximate** | Moderate — windowed vs global attention, no RPB |
-| Drop `key_padding_mask` | **Approximate** | Small with mostly-valid inputs; larger with sparse scenes |
+| NATTEN → exact NA1D (default) | **Safe** | Float precision (< 1e-6) |
+| NATTEN → global MHA (legacy `--natten global`) | **Approximate** | Moderate — windowed vs global attention, no RPB |
+| `key_padding_mask` as additive mask | **Safe** | Float precision |
 | `PointsEncoder` bool-index | **Safe** | Negligible (eval mode BN, zero-gated output) |
 | `AgentEncoder` bool-index | **Safe** | Negligible (zero-gate after encoder) |
 | `atan2` substitute | **Safe** | < 1e-6 rad |

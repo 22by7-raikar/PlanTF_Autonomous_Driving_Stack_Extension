@@ -30,9 +30,9 @@ Three independent tracks built on top of the published PlanTF checkpoint (no ret
 |-------|------------|
 | [Geometric mode re-ranking](#geometric-mode-re-ranking) | mini_eval_v2 NR-CLS: 0.8401 → 0.8478 (+0.77%); driven by one recovered scenario, not yet shown to be significant |
 | [Expanded evaluation benchmark](#expanded-evaluation-benchmark) | 84-scenario benchmark across 8 driving situation types |
-| [TensorRT + C++ runtime](#tensorrt-and-c-runtime) | 1.2–1.7 ms (TRT FP16/FP32) vs ~20 ms CPU Python; patched model only (see note) |
+| [TensorRT + C++ runtime](#tensorrt-and-c-runtime) | 1.2–1.7 ms (TRT FP16/FP32) vs ~20 ms CPU Python; exact ONNX export of the NATTEN model (see note) |
 
-CI: lint, 33 unit tests, C++ ORT build — runs on every push/PR.
+CI: lint, unit tests, ONNX export parity against real NATTEN, C++ ORT build — runs on every push/PR.
 
 All fork behaviour is opt-in. With default config, `planner=planTF` behaves exactly like upstream (argmax mode selection, original NATTEN model):
 
@@ -41,7 +41,7 @@ All fork behaviour is opt-in. With default config, `planner=planTF` behaves exac
 | `use_mode_reranker` | `false` | Select the output mode with the geometric re-ranker instead of argmax |
 | `reranker_lambda` | `0.3` | Coverage weight of the re-ranker |
 | `use_tl_brake` | `false` | Experimental: constant-deceleration stop before a red on-route polygon (`src/planners/tl_safety.py`) |
-| `model_patch` | `none` | `natten_onnx` / `natten_faithful`: run the closed-loop sim on the patched model used for ONNX/TensorRT export |
+| `model_patch` | `none` | `onnx_export`: run the closed-loop sim on the exact graph exported to ONNX/TensorRT. Also `natten_exact`, `natten_onnx` (legacy global MHA), `natten_faithful` |
 
 ---
 
@@ -418,7 +418,9 @@ See [Results](#this-fork--mini_eval_v2-84-scenarios-nr-cls) for scores. Full sel
 
 I exported the model to ONNX and built TensorRT engines to measure achievable inference latency. This does not alter planner behaviour; it establishes a deployment baseline.
 
-**Note:** NATTEN (`NeighborhoodAttention1D`) has no ONNX symbolic in PyTorch 1.12. Export requires replacing it with global `nn.MultiheadAttention`; this costs **0.35 m/timestep** mean position error against the original checkpoint. All numbers below are for the patched model. Its closed-loop score has not been measured yet; run `bash script/mini_eval_v2.sh closed_loop_nonreactive_agents planner.imitation_planner.model_patch=natten_onnx` and compare against the baseline with `script/compare_runs.py` to find out whether the deployable model still drives as well. Full patch details and fidelity ablation: [`inference/README.md`](inference/README.md).
+**Exact export.** NATTEN (`NeighborhoodAttention1D`) has no ONNX symbolic in PyTorch 1.12. The first version of this export replaced it with global `nn.MultiheadAttention` (0.35 m mean position error on the released checkpoint) and also dropped the encoder's `key_padding_mask`, which lets padded agents and polygons into attention in real scenes. The export now uses `_ExactNA1D`, a gather-based re-implementation of NATTEN-1D that keeps the relative positional bias and edge windows, and keeps the padding mask. The exported ONNX graph matches original PyTorch + NATTEN to ~1e-6 m on padded inputs. This is checked in CI against the real NATTEN kernel (`tests/test_onnx_patches.py`). Details: [`inference/README.md`](inference/README.md#exact-natten-export-default).
+
+The latency figures below were measured on the legacy graph and need re-measuring with the exact export (`python inference/deploy/export_onnx.py`, then rebuild the TRT engines). To confirm closed-loop behaviour of the exported graph, run `bash script/mini_eval_v2.sh closed_loop_nonreactive_agents planner.imitation_planner.model_patch=onnx_export` and compare against the baseline with `script/compare_runs.py`. Full patch details and fidelity ablation: [`inference/README.md`](inference/README.md).
 
 | Runtime | Precision | Latency (p50) | vs CPU |
 |---------|-----------|--------------|--------|

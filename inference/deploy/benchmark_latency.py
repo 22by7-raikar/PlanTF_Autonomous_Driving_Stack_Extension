@@ -30,13 +30,7 @@ import numpy as np
 import torch
 
 from run_inference import load_model, make_dummy_input, _build_onnx_feeds
-from patches import (
-    patch_natten_for_onnx,
-    patch_mha_for_onnx,
-    patch_boolean_indexing_for_onnx,
-    patch_agent_encoder_for_onnx,
-    patch_planning_model_for_onnx,
-)
+from patches import apply_onnx_export_patches
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +84,8 @@ def main():
     parser.add_argument("--onnx",     default=_default_onnx)
     parser.add_argument("--agents",   type=int, default=33)
     parser.add_argument("--polygons", type=int, default=152)
+    parser.add_argument("--natten",   choices=["exact", "global"], default="exact",
+                        help="NATTEN replacement: exact (default) or legacy global MHA")
     parser.add_argument("--warmup",   type=int, default=5,
                         help="Warmup runs (excluded from stats)")
     parser.add_argument("--runs",     type=int, default=50,
@@ -125,11 +121,7 @@ def main():
     # ------------------------------------------------------------------
     print("Loading patched PyTorch model ...")
     model_patched = load_model(args.ckpt, device)
-    patch_natten_for_onnx(model_patched)
-    patch_mha_for_onnx(model_patched)
-    patch_boolean_indexing_for_onnx(model_patched)
-    patch_agent_encoder_for_onnx(model_patched)
-    patch_planning_model_for_onnx(model_patched)
+    apply_onnx_export_patches(model_patched, natten=args.natten)
     print(f"  Timing ({args.warmup} warmup, {args.runs} runs) ...", end=" ", flush=True)
     t_patched = _time_pytorch(model_patched, data, args.warmup, args.runs)
     results["Patched PyTorch"] = t_patched
