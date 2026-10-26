@@ -8,19 +8,28 @@
 # for rapid dev cycles.
 #
 # Usage:
-#   bash script/mini_eval_v2.sh [challenge]
+#   bash script/mini_eval_v2.sh [challenge] [hydra overrides...]
 #
 # challenge defaults to closed_loop_nonreactive_agents.
+# Any further arguments are passed to run_simulation.py as Hydra overrides:
+#   bash script/mini_eval_v2.sh closed_loop_nonreactive_agents \
+#       planner.imitation_planner.use_mode_reranker=true
+#
+# Environment:
+#   NUPLAN_DATA_ROOT  nuPlan dataset root (must contain nuplan-v1.1_mini)
+#   RUN_TAG           optional name for the run directory (default: timestamp)
 # Other options:
 #   closed_loop_reactive_agents
 #   open_loop_boxes
 #
 # Outputs:
-#   datasets/nuplan/exp/exp/simulation/<challenge>/<timestamp>/
+#   $NUPLAN_EXP_ROOT/exp/simulation/<challenge>/mini_eval_v2/planTF/<RUN_TAG>/
 #   Aggregated metrics and per-scenario scores auto-printed at end.
 #
 # After the run, summarize results:
-#   python script/summarize_eval.py --challenge <challenge>
+#   python script/summarize_eval.py --challenge <challenge> --save
+# Compare two runs scenario-by-scenario:
+#   python script/compare_runs.py <baseline.csv> <candidate.csv>
 #
 # See docs/EVAL_PLAN.md for benchmark philosophy.
 # See docs/mini_scenario_inventory.md for scenario selection rationale.
@@ -28,6 +37,7 @@
 set -euo pipefail
 
 CHALLENGE="${1:-closed_loop_nonreactive_agents}"
+shift || true
 cwd=$(pwd)
 CKPT_ROOT="$cwd/checkpoints"
 PLANNER="planTF"
@@ -53,30 +63,31 @@ echo "  Buckets:    intersections, lane_change, lead_vehicle, pedestrian,"
 echo "              stop_and_go, high_medium_speed, near_long_vehicle, edge_cases"
 echo ""
 echo "  NOTE: This benchmark takes significantly longer than mini_benchmark.sh."
-echo "        Expect ~8–15 minutes depending on hardware."
+echo "        Expect ~20 minutes on an RTX 3060 laptop (sequential worker)."
 echo "  NOTE: Lane-change coverage is limited by mini-split availability (7 tokens total)."
 echo "========================================================"
 echo ""
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 export PYTHONPATH="$cwd:${PYTHONPATH:-}"
 
+# worker=sequential: Ray workers don't inherit PYTHONPATH, so src.* imports fail.
 python run_simulation.py \
     +simulation="$CHALLENGE" \
     planner="$PLANNER" \
     scenario_builder=nuplan \
+    scenario_builder.data_root="$NUPLAN_DATA_ROOT/nuplan-v1.1_mini/data/cache/mini" \
     scenario_filter=mini_eval_v2 \
-    worker.threads_per_node=8 \
-    experiment_uid="mini_eval_v2/$PLANNER/$TIMESTAMP" \
+    worker=sequential \
+    experiment_uid="mini_eval_v2/$PLANNER/$RUN_TAG" \
     verbose=true \
-    planner.imitation_planner.planner_ckpt="$CKPT_ROOT/$PLANNER.ckpt"
+    planner.imitation_planner.planner_ckpt="$CKPT_ROOT/$PLANNER.ckpt" \
+    "$@"
 
 echo ""
 echo "========================================================"
 echo "  Simulation complete."
 echo ""
 echo "  To summarize results by bucket:"
-echo "    python script/summarize_eval.py \\"
-echo "      --challenge $CHALLENGE \\"
-echo "      --v1-dir  benchmarks/mini_v1"
+echo "    python script/summarize_eval.py --challenge $CHALLENGE --save"
 echo "========================================================"

@@ -14,6 +14,8 @@ Arguments:
     --v1-dir      Path to mini_v1 baseline directory for comparison
                   (default: benchmarks/mini_v1).
     --save        Save summary to outputs/eval_v2/ as CSV + MD.
+    --tag         Label added to the saved file names, e.g. "baseline" or
+                  "rerank_l0.3" -> eval_v2_<tag>_<timestamp>.csv
 
 Examples:
     # Latest run, default challenge
@@ -156,10 +158,11 @@ V1_TOKENS = {
 
 
 def _find_latest_run(challenge: str, base: str) -> Path:
+    # Recursive: experiment_uid may be nested (e.g. mini_eval_v2/planTF/<tag>).
     pattern = os.path.join(
-        base, "nuplan/exp/exp/simulation", challenge, "*/aggregator_metric/*.parquet"
+        base, "nuplan/exp/exp/simulation", challenge, "**/aggregator_metric/*.parquet"
     )
-    files = sorted(glob.glob(pattern))
+    files = sorted(glob.glob(pattern, recursive=True), key=os.path.getmtime)
     if not files:
         raise FileNotFoundError(
             f"No aggregator parquet found for challenge '{challenge}' under {base}\n"
@@ -192,6 +195,7 @@ def main():
     ap.add_argument("--run-dir", default=None, help="Path to aggregator_metric/")
     ap.add_argument("--v1-dir", default="benchmarks/mini_v1", help="mini_v1 baseline dir")
     ap.add_argument("--save", action="store_true", help="Save results to outputs/eval_v2/")
+    ap.add_argument("--tag", default=None, help="Label for saved file names")
     ap.add_argument("--datasets-root", default="datasets", help="Root of datasets dir")
     args = ap.parse_args()
 
@@ -201,7 +205,7 @@ def main():
         if not parquet_files:
             print(f"ERROR: No parquet files in {args.run_dir}")
             sys.exit(1)
-        parquet_path = parquet_files[-1]
+        parquet_path = max(parquet_files, key=os.path.getmtime)
     else:
         parquet_path = _find_latest_run(args.challenge, args.datasets_root)
 
@@ -301,6 +305,8 @@ def main():
     # ── Save ─────────────────────────────────────────────────────────────────
     if args.save:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.tag:
+            ts = f"{args.tag}_{ts}"
         out_dir = Path("outputs/eval_v2")
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -315,6 +321,7 @@ def main():
         with open(md_path, "w") as f:
             f.write(f"# mini_eval_v2 Results — {ts}\n\n")
             f.write(f"**Challenge:** {args.challenge}  \n")
+            f.write(f"**Source:** `{parquet_path}`  \n")
             f.write(f"**Overall mean score:** {overall:.4f}  \n")
             f.write(f"**Scenarios:** {len(all_scores)}  \n")
             f.write(f"**Failures (<0.5):** {failures}  \n\n")
