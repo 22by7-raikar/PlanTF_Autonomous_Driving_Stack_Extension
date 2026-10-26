@@ -4,7 +4,7 @@
 # 2026-03-25 baseline run (84 scenarios, score=0.8401).
 #
 # Use this filter to quickly evaluate TL-specific changes (e.g. tl_safety.py)
-# without running the full 84-scenario suite (~10 min vs ~40 min).
+# without running the full 84-scenario suite (~5 min vs ~20 min on an RTX 3060 laptop).
 #
 # Baseline scores per scenario:
 #   5 × score=0.000  (zero-score, post-processor targets these)

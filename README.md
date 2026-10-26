@@ -28,11 +28,20 @@ Three independent tracks built on top of the published PlanTF checkpoint (no ret
 
 | Track | Key result |
 |-------|------------|
-| [Geometric mode re-ranking](#geometric-mode-re-ranking) | mini_eval_v2 NR-CLS: 0.8401 → **0.8478** (+0.77%) |
+| [Geometric mode re-ranking](#geometric-mode-re-ranking) | mini_eval_v2 NR-CLS: 0.8401 → 0.8478 (+0.77%); driven by one recovered scenario, not yet shown to be significant |
 | [Expanded evaluation benchmark](#expanded-evaluation-benchmark) | 84-scenario benchmark across 8 driving situation types |
 | [TensorRT + C++ runtime](#tensorrt-and-c-runtime) | 1.2–1.7 ms (TRT FP16/FP32) vs ~20 ms CPU Python; patched model only (see note) |
 
-CI: lint, 16 unit tests, C++ ORT build — runs on every push/PR.
+CI: lint, 33 unit tests, C++ ORT build — runs on every push/PR.
+
+All fork behaviour is opt-in. With default config, `planner=planTF` behaves exactly like upstream (argmax mode selection, original NATTEN model):
+
+| Planner flag (`planner.imitation_planner.*`) | Default | Effect |
+|---|---|---|
+| `use_mode_reranker` | `false` | Select the output mode with the geometric re-ranker instead of argmax |
+| `reranker_lambda` | `0.3` | Coverage weight of the re-ranker |
+| `use_tl_brake` | `false` | Experimental: constant-deceleration stop before a red on-route polygon (`src/planners/tl_safety.py`) |
+| `model_patch` | `none` | `natten_onnx` / `natten_faithful`: run the closed-loop sim on the patched model used for ONNX/TensorRT export |
 
 ---
 
@@ -83,7 +92,7 @@ pip install -r ./requirements.txt
 
 # setup this fork
 cd ..
-git clone https://github.com/apr/planTF.git && cd planTF
+git clone https://github.com/22by7-raikar/PlanTF_Autonomous_Driving_Stack_Extension.git planTF && cd planTF
 sh ./script/setup_env.sh
 ```
 
@@ -144,6 +153,21 @@ Place the trained models at `planTF/checkpoints/`
 - run **Test14-random**: `sh ./script/plantf_benchmarks.sh test14-random`
 - run **Test14-hard**: `sh ./script/plantf_benchmarks.sh test14-hard`
 - run **Val14** (this may take a long time): `sh ./script/plantf_benchmarks.sh val14`
+
+The three benchmarks above need the full nuPlan test/val splits. On the mini split, use:
+
+```sh
+# 84-scenario benchmark; extra arguments are Hydra overrides
+bash script/mini_eval_v2.sh closed_loop_nonreactive_agents                                        # baseline
+bash script/mini_eval_v2.sh closed_loop_nonreactive_agents planner.imitation_planner.use_mode_reranker=true
+python script/summarize_eval.py --save --tag <name>       # per-scenario CSV -> outputs/eval_v2/
+
+# Paired per-scenario comparison (bootstrap CI, sign test, tune/holdout split)
+python script/compare_runs.py outputs/eval_v2/eval_v2_baseline_*.csv outputs/eval_v2/eval_v2_rerank_*.csv
+
+# Lambda sweep: baseline + 5 settings (~2 h), tune/holdout reports per setting
+bash script/sweep_lambda.sh 0.1 0.2 0.3 0.5 0.7
+```
 
 ## Results
 
@@ -312,6 +336,8 @@ Bucket breakdown (84 scenarios, NR-CLS):
 | near_long_vehicle | 5 | 0.9031 | 0.9033 | +0.000 |
 | edge_cases | 8 | 0.7278 | 0.7311 | +0.003 |
 
+**How much to trust this.** The +0.0077 overall gain is about what one scenario going from 0.0 to ~0.65 contributes on its own (0.65 / 84 = 0.0077), and the re-ranked run recovered exactly one zero-score scenario (`0136ce79864c53e1`). Other buckets moved by less than 0.01 in both directions. λ was also picked on a subset of these same scenarios. Until a paired comparison (`script/compare_runs.py`) shows a confidence interval that excludes zero on the holdout split, treat this as a hypothesis, not a measured improvement.
+
 The gain is almost entirely in `stop_and_go` (+0.036, 1 failure recovered). `intersections` is unchanged: all 7 failures produce no geometrically-correct mode in K=6, so the re-ranker has nothing to recover. The `pedestrian` bucket shows a small regression (−0.009): the coverage heuristic can penalise lateral pedestrian-avoidance manoeuvres that move away from the lane centreline. Skipping re-ranking when the nearest on-route polygon is type CROSSWALK is a pending fix.
 
 Hardware: RTX 3060 · `worker=sequential` · nuPlan mini split.
@@ -332,9 +358,13 @@ score[k] = (1 − λ) · softmax(prob)[k]  +  λ · coverage[k]
 
 `coverage[k]` is the fraction of mode k's waypoints falling within 3.5 m of any on-route map polygon centre, in ego-local frame (normalised by `NuplanFeature`). The 3.5 m radius is chosen to accommodate a full lane width (~3 m) without including adjacent-lane polygons. Falls back to argmax when no on-route polygons are present in the scene.
 
-λ=0.3 was chosen based on a 21-scenario TL-intersection eval where it produced the best directional result among {0.1, 0.2, 0.3} tested by hand. A full grid search on the 84-scenario benchmark was not run: each run takes ~20 min, so a 5-point sweep would cost ~1.5 hours. λ=0.3 is an initial working value, not a tuned optimum.
+λ=0.3 was chosen based on a 21-scenario TL-intersection eval where it produced the best directional result among {0.1, 0.2, 0.3} tested by hand. Those 21 scenarios are part of the 84 the result is reported on, so the reported gain is not on held-out data. λ=0.3 is an initial working value, not a tuned optimum. `script/sweep_lambda.sh` runs the full sweep, selecting λ on a fixed hash-based "tune" half of the tokens and reporting it on the "holdout" half.
+
+Enable with `planner.imitation_planner.use_mode_reranker=true` (off by default).
 
 Results on mini_eval_v2 (84 scenarios): main gain in `stop_and_go` (+0.036), `intersections` unchanged, small regression in `pedestrian` (−0.009), net +0.77%. See [Results](#this-fork--mini_eval_v2-84-scenarios-nr-cls) for the full bucket breakdown. Unit tests: `tests/test_mode_reranker.py` (16 tests).
+
+**Traffic-light brake (experimental).** `src/planners/tl_safety.py` replaces the trajectory timing with a constant-deceleration stop before the nearest red on-route polygon, keeping the path geometry. It is enabled with `planner.imitation_planner.use_tl_brake=true` and has unit tests (`tests/test_tl_safety.py`) but has not been evaluated closed-loop yet; `config/scenario_filter/tl_intersection_eval.yaml` is the intended 21-scenario check.
 
 **Failure analysis.** The four zero-score TL intersection scenarios that motivated this work, captured from nuboard:
 
@@ -388,7 +418,7 @@ See [Results](#this-fork--mini_eval_v2-84-scenarios-nr-cls) for scores. Full sel
 
 I exported the model to ONNX and built TensorRT engines to measure achievable inference latency. This does not alter planner behaviour; it establishes a deployment baseline.
 
-**Note:** NATTEN (`NeighborhoodAttention1D`) has no ONNX symbolic in PyTorch 1.12. Export requires replacing it with global `nn.MultiheadAttention`; this costs **0.35 m/timestep** mean position error against the original checkpoint. All numbers below are for the patched model. Full patch details and fidelity ablation: [`inference/README.md`](inference/README.md).
+**Note:** NATTEN (`NeighborhoodAttention1D`) has no ONNX symbolic in PyTorch 1.12. Export requires replacing it with global `nn.MultiheadAttention`; this costs **0.35 m/timestep** mean position error against the original checkpoint. All numbers below are for the patched model. Its closed-loop score has not been measured yet; run `bash script/mini_eval_v2.sh closed_loop_nonreactive_agents planner.imitation_planner.model_patch=natten_onnx` and compare against the baseline with `script/compare_runs.py` to find out whether the deployable model still drives as well. Full patch details and fidelity ablation: [`inference/README.md`](inference/README.md).
 
 | Runtime | Precision | Latency (p50) | vs CPU |
 |---------|-----------|--------------|--------|
@@ -415,11 +445,11 @@ The following files from [jchengai/planTF](https://github.com/jchengai/planTF) w
 
 | File | Change | Why |
 |---|---|---|
-| `src/planners/imitation_planner.py` | Wire in `rerank_modes()`; split feature-build and forward-pass timing with CUDA sync; add opt-in `record_latency` flag | Core fork change (re-ranker); accurate per-phase latency measurement; prevents latency CSV accumulation during eval runs |
+| `src/planners/imitation_planner.py` | Opt-in `use_mode_reranker` / `reranker_lambda`, `use_tl_brake`, `model_patch` and `record_latency` flags (all off by default); split feature-build and forward-pass timing with CUDA sync | Fork features without changing default behaviour; accurate per-phase latency measurement |
 | `src/models/planTF/layers/embedding.py` | `F.interpolate(scale_factor=...)` → `F.interpolate(size=[...])` | PyTorch 1.12 ONNX shape-inference cannot handle dynamic scalar `scale_factor`; functionally identical in all code paths. Detailed in [`inference/README.md`](inference/README.md) |
 | `config/scenario_filter/mini.yaml` | `expand_scenarios: true` → `false` | With `true`, nuPlan expands each token into multiple sub-scenarios; token-pinned benchmarks (`mini_benchmark.yaml`, `mini_eval_v2.yaml`) become non-reproducible |
 | `run_simulation.py` | Null-check before `max(result, ...)` in `print_simulation_results` | Upstream crashes with `ValueError: max() arg is an empty sequence` when a run produces no aggregator parquet (e.g. on token-validation failures) |
-| `config/planner/planTF.yaml` | Add `record_latency: false` | Exposes the `record_latency` flag added to `ImitationPlanner` |
+| `config/planner/planTF.yaml` | Add `record_latency`, `use_mode_reranker`, `reranker_lambda`, `use_tl_brake`, `model_patch` | Exposes the flags added to `ImitationPlanner` |
 | `src/metrics/mr.py` → `miss_rate.py` | Rename; `__init__.py` import updated | `MR` (miss rate) is the least self-describing name alongside `min_ade.py` / `min_fde.py` |
 
 ---

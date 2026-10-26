@@ -13,8 +13,14 @@
 
 | Run dir (under `.../closed_loop_nonreactive_agents/`) | Scenarios | Config | Overall | Output file |
 |---|---|---|---|---|
-| `2026.03.25.16.06.57` | 84 | baseline (argmax) | **0.8401** | [eval_v2_20260327_012254.md](eval_v2_20260327_012254.md) |
-| `2026.03.26.16.39.15` | 84 | re-ranked (λ=0.3) | **0.8478** | [eval_v2_20260327_012317.md](eval_v2_20260327_012317.md) |
+| `2026.03.25.16.06.57` | 84 | baseline (argmax) | **0.8401** | `eval_v2_20260327_012254.md` (not committed) |
+| `2026.03.26.16.39.15` | 84 | re-ranked (λ=0.3) | **0.8478** | `eval_v2_20260327_012317.md` (not committed) |
+
+> **Missing files.** The per-scenario CSV/MD files for the two authoritative
+> runs above were never committed; only the stale 2026-03-24 run is in this
+> directory. Until they are added (`eval_v2_20260327_012254.{csv,md}` and
+> `eval_v2_20260327_012317.{csv,md}`), the 0.8401 / 0.8478 numbers cannot be
+> checked from the repo, and `script/compare_runs.py` cannot be run on them.
 
 Stale runs: `2026.03.24` (`mini_eval_v2/planTF/v2_run1/`): 71/84 scenarios ran; score 0.8166. `eval_v2_20260327_011722` is a March-27 re-run of that same stale directory — also 71 scenarios, 0.8166. Both superseded.
 
@@ -81,28 +87,52 @@ The `Selected` column in `docs/mini_scenario_inventory.md` shows how many tokens
 | File | Run | Scen | Score | Notes |
 |------|-----|------|-------|-------|
 | [eval_v2_20260324_173928.md](eval_v2_20260324_173928.md) | 2026-03-24 | 71 | 0.8166 | Stale — 13 tokens absent from mini snapshot |
-| [eval_v2_20260327_011722.md](eval_v2_20260327_011722.md) | 2026-03-27 re-run | 71 | 0.8166 | Stale — same old dir, redundant |
-| [eval_v2_20260327_012254.md](eval_v2_20260327_012254.md) | 2026-03-27 **baseline** | 84 | **0.8401** | **Authoritative baseline** |
-| [eval_v2_20260327_012317.md](eval_v2_20260327_012317.md) | 2026-03-27 **re-ranked** | 84 | **0.8478** | **Authoritative re-ranked (λ=0.3)** |
+| `eval_v2_20260327_011722.md` (not committed) | 2026-03-27 re-run | 71 | 0.8166 | Stale — same old dir, redundant |
+| `eval_v2_20260327_012254.md` (not committed) | 2026-03-27 **baseline** | 84 | **0.8401** | **Authoritative baseline** |
+| `eval_v2_20260327_012317.md` (not committed) | 2026-03-27 **re-ranked** | 84 | **0.8478** | **Authoritative re-ranked (λ=0.3)** |
 
 ---
 
 ## Reproducibility
 
 ```bash
-# Baseline
+# Baseline (re-ranker is off by default)
 bash script/mini_eval_v2.sh closed_loop_nonreactive_agents
-python script/summarize_eval.py --save
+python script/summarize_eval.py --save --tag baseline
 
-# Re-ranked (requires USE_MODE_RERANKER=1 or planner config with reranker enabled)
-bash script/mini_eval_v2.sh closed_loop_nonreactive_agents
-python script/summarize_eval.py --save
+# Re-ranked
+bash script/mini_eval_v2.sh closed_loop_nonreactive_agents \
+    planner.imitation_planner.use_mode_reranker=true \
+    planner.imitation_planner.reranker_lambda=0.3
+python script/summarize_eval.py --save --tag rerank_l0.3
+
+# Paired comparison (bootstrap CI, sign test); use --split holdout for the
+# half of the tokens not used to choose lambda
+python script/compare_runs.py outputs/eval_v2/eval_v2_baseline_*.csv \
+    outputs/eval_v2/eval_v2_rerank_l0.3_*.csv
 ```
 
-> `worker=sequential` is required (Ray workers don't inherit PYTHONPATH).
+> `mini_eval_v2.sh` sets `worker=sequential` (Ray workers don't inherit
+> PYTHONPATH) and `scenario_builder.data_root` from `$NUPLAN_DATA_ROOT`.
+
+## Statistical caveat
+
+The +0.0077 overall delta equals what a single scenario going from 0.0 to
+~0.65 contributes (0.65 / 84), and exactly one zero-score scenario
+(`0136ce79864c53e1`) was recovered. No other bucket moved by more than 0.01.
+λ was picked on the 21 TL-intersection scenarios, which are a subset of these
+84. Treat the gain as unconfirmed until `compare_runs.py --split holdout`
+shows a confidence interval that excludes zero.
 
 
 ---
+
+# Archive: stale 2026-03-24 run (71 / 84 scenarios)
+
+Everything below describes the superseded `v2_run1` run, kept for reference.
+It is the run whose CSV/MD are committed here
+(`eval_v2_20260324_173928.*`). Do not compare it with the 84-scenario runs
+above.
 
 ## Overall Results
 

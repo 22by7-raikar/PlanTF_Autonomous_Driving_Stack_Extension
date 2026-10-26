@@ -122,13 +122,13 @@ to the ego vehicle. Run both challenges for a complete picture.
 - **Patched model fidelity** — 5 ONNX compatibility patches are numerically equivalent to the original on all non-NATTEN operations (max Δ < 1e-5 on CPU).
 - **NATTEN approximation cost**:
   - Worst-case trajectory divergence: 0.86 m max, mean 0.35 m/step
-  - TRT FP32 path (Patched PyTorch vs TRT FP32): 1.6 mm — safe for deployment
+  - TRT FP32 path (Patched PyTorch vs TRT FP32): 1.6 mm — TRT matches the patched model (the patched model itself is 0.35 m from the original checkpoint)
 - **TensorRT latency** (RTX 3060, batch=1):
   - FP16: **1.2 ms** (16.2× over CPU)
   - FP32: **1.7 ms**, max Δ = 1.6 mm vs ORT — verified fidelity
 - **mini_benchmark_v1** (10 scenarios): final NR-CLS = **0.7716**
 - **mini_eval_v2 baseline** (84 scenarios, NR-CLS): **0.8401** — intersections bucket weakest at 0.7055; TL compliance identified as primary weakness
-- **Mode re-ranker** (λ=0.3, `src/planners/mode_reranker.py`): **0.8478** (+0.77%); main gain `stop_and_go` +0.036; regression `pedestrian` −0.009 under investigation
+- **Mode re-ranker** (λ=0.3, `src/planners/mode_reranker.py`): **0.8478** (+0.77%); main gain `stop_and_go` +0.036; regression `pedestrian` −0.009 under investigation. Driven by one recovered scenario; not yet confirmed on held-out tokens (see `script/compare_runs.py`)
 - **C++ runtime** (RTX 3060): ORT matches Python ORT < 0.001 mm; TRT FP16 0.770 ms (1298 QPS), FP32 1.344 ms (744 QPS)
 
 ## What Is Still Pending
